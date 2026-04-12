@@ -1,46 +1,107 @@
 //! Zeiss CZI (ZISRAWFILE) format reader.
 //!
-//! Segments use a 32-byte header:
-//!   bytes  0-15: segment type (ASCII, zero-padded) e.g. "ZISRAWFILE"
-//!   bytes 16-23: allocated size (int64 LE)
-//!   bytes 24-31: used size (int64 LE)
+//! This reader ports a pragmatic subset of Bio-Formats' dataset modelling:
+//! - explicit logical channel vs. RGB sample separation
+//! - multi-series grouping across scene/acquisition/angle/mosaic dimensions
+//! - multi-file dataset discovery
+//! - typed metadata extraction from the CZI metadata XML
 //!
 //! Supported compressions: Uncompressed, JPEG (new-style), LZW, Zstd.
-//! JPEG-XR is detected but not decoded (needs a JXRC decoder).
+//! JPEG-XR is detected but not decoded.
 
-use std::collections::HashMap;
-use std::fs::File;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
+use crate::common::metadata::{
+    ChannelMetadata, DimensionOrder, ImageMetadata, MetadataValue, PlaneMetadata,
+};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
 use crate::snapshot::ReaderSnapshot;
+use roxmltree::{Document, Node};
 use serde::{Deserialize, Serialize};
 
-// ---- pixel types (from DirectoryEntry) -------------------------------------
-
-fn czi_pixel_type(code: i32) -> (PixelType, u32) {
-    // Returns (pixel_type, samples_per_pixel)
-    match code {
-        0 => (PixelType::Uint8, 1),    // Gray8
-        1 => (PixelType::Uint16, 1),   // Gray16
-        2 => (PixelType::Float32, 1),  // GrayFloat
-        3 => (PixelType::Uint8, 3),    // Bgr24
-        4 => (PixelType::Uint16, 3),   // Bgr48
-        8 => (PixelType::Float32, 3),  // BgrFloat
-        9 => (PixelType::Uint8, 4),    // Bgra32
-        10 => (PixelType::Float32, 2), // Complex (re+im)
-        11 => (PixelType::Float32, 2), // ComplexFloat
-        12 => (PixelType::Uint32, 1),  // Gray32
-        13 => (PixelType::Float64, 1), // GrayDouble
-        _ => (PixelType::Uint8, 1),
-    }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct CziPixelInfo {
+    pixel_type: PixelType,
+    samples_per_pixel: u32,
+    rgb: bool,
+    bgr_order: bool,
 }
 
-// ---- segment header --------------------------------------------------------
+fn czi_pixel_info(code: i32) -> CziPixelInfo {
+    match code {
+        0 => CziPixelInfo {
+            pixel_type: PixelType::Uint8,
+            samples_per_pixel: 1,
+            rgb: false,
+            bgr_order: false,
+        },
+        1 => CziPixelInfo {
+            pixel_type: PixelType::Uint16,
+            samples_per_pixel: 1,
+            rgb: false,
+            bgr_order: false,
+        },
+        2 => CziPixelInfo {
+            pixel_type: PixelType::Float32,
+            samples_per_pixel: 1,
+            rgb: false,
+            bgr_order: false,
+        },
+        3 => CziPixelInfo {
+            pixel_type: PixelType::Uint8,
+            samples_per_pixel: 3,
+            rgb: true,
+            bgr_order: true,
+        },
+        4 => CziPixelInfo {
+            pixel_type: PixelType::Uint16,
+            samples_per_pixel: 3,
+            rgb: true,
+            bgr_order: true,
+        },
+        8 => CziPixelInfo {
+            pixel_type: PixelType::Float32,
+            samples_per_pixel: 3,
+            rgb: true,
+            bgr_order: true,
+        },
+        9 => CziPixelInfo {
+            pixel_type: PixelType::Uint8,
+            samples_per_pixel: 4,
+            rgb: true,
+            bgr_order: true,
+        },
+        10 | 11 => CziPixelInfo {
+            pixel_type: PixelType::Float32,
+            samples_per_pixel: 2,
+            rgb: false,
+            bgr_order: false,
+        },
+        12 => CziPixelInfo {
+            pixel_type: PixelType::Uint32,
+            samples_per_pixel: 1,
+            rgb: false,
+            bgr_order: false,
+        },
+        13 => CziPixelInfo {
+            pixel_type: PixelType::Float64,
+            samples_per_pixel: 1,
+            rgb: false,
+            bgr_order: false,
+        },
+        _ => CziPixelInfo {
+            pixel_type: PixelType::Uint8,
+            samples_per_pixel: 1,
+            rgb: false,
+            bgr_order: false,
+        },
+    }
+}
 
 const SEG_HEADER: usize = 32;
 
@@ -52,32 +113,30 @@ fn read_seg_type(data: &[u8]) -> String {
 fn read_i32(data: &[u8], off: usize) -> i32 {
     i32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
 }
+
 fn read_i64(data: &[u8], off: usize) -> i64 {
     i64::from_le_bytes(data[off..off + 8].try_into().unwrap_or([0; 8]))
 }
+
 fn read_u64(data: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(data[off..off + 8].try_into().unwrap_or([0; 8]))
 }
-
-// ---- DirectoryEntry (256 bytes) -------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntry {
     pixel_type: i32,
     file_position: i64,
     compression: i32,
-    // Dimensions from DimensionEntry array
-    dims: HashMap<String, (i32, i32)>, // dim_name -> (start, size)
+    dims: HashMap<String, (i32, i32)>,
 }
 
 fn parse_dir_entry(data: &[u8]) -> DirEntry {
-    // schema 0-1 (2 bytes)
     let pixel_type = read_i32(data, 2);
     let file_position = read_i64(data, 6);
     let compression = read_i32(data, 18);
     let dim_count = read_i32(data, 28) as usize;
 
-    let mut dims: HashMap<String, (i32, i32)> = HashMap::new();
+    let mut dims = HashMap::new();
     let dim_array_start = 32;
     for i in 0..dim_count {
         let off = dim_array_start + i * 20;
@@ -104,22 +163,12 @@ fn parse_dir_entry(data: &[u8]) -> DirEntry {
     }
 }
 
-// ---- file parsing ----------------------------------------------------------
-
-struct CziParsed {
+struct CziParsedFile {
     meta_xml: String,
     entries: Vec<DirEntry>,
-    width: u32,
-    height: u32,
-    z_count: u32,
-    c_count: u32,
-    t_count: u32,
-    pixel_type: PixelType,
-    spp: u32,
 }
 
-fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
-    // --- Read file header segment ---
+fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsedFile> {
     let mut hdr = vec![0u8; SEG_HEADER];
     f.read_exact(&mut hdr)?;
     let seg_type = read_seg_type(&hdr);
@@ -130,20 +179,16 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         ));
     }
 
-    // FileHeader data starts after the 32-byte segment header
     let mut fh = vec![0u8; 80];
     f.read_exact(&mut fh)?;
-    // major = fh[0..4], minor = fh[4..8]
     let dir_position = read_u64(&fh, 36);
     let meta_position = read_u64(&fh, 44);
 
-    // --- Read metadata segment ---
     let mut meta_xml = String::new();
     if meta_position > 0 {
         f.seek(SeekFrom::Start(meta_position))?;
         let mut seg_hdr = vec![0u8; SEG_HEADER];
         f.read_exact(&mut seg_hdr)?;
-        // Metadata segment body: xml_size (i32), attach_size (i32), reserved (248), xml data
         let mut meta_body_hdr = vec![0u8; 256];
         f.read_exact(&mut meta_body_hdr)?;
         let xml_size = read_i32(&meta_body_hdr, 0) as usize;
@@ -154,13 +199,11 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         }
     }
 
-    // --- Read directory segment ---
-    let mut entries: Vec<DirEntry> = Vec::new();
+    let mut entries = Vec::new();
     if dir_position > 0 {
         f.seek(SeekFrom::Start(dir_position))?;
         let mut seg_hdr = vec![0u8; SEG_HEADER];
         f.read_exact(&mut seg_hdr)?;
-        // Directory body: entry_count (i32), reserved (124), DirectoryEntry[]
         let mut dir_hdr = vec![0u8; 128];
         f.read_exact(&mut dir_hdr)?;
         let entry_count = read_i32(&dir_hdr, 0) as usize;
@@ -173,87 +216,27 @@ fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsed> {
         }
     }
 
-    // Compute dimensions from entries
-    let mut max_x = 0u32;
-    let mut max_y = 0u32;
-    let mut max_z = 0i32;
-    let mut max_c = 0i32;
-    let mut max_t = 0i32;
-    let mut pixel_type = 0i32;
-
-    for e in &entries {
-        pixel_type = e.pixel_type;
-        if let Some(&(_, sz)) = e.dims.get("X") {
-            if sz as u32 > max_x {
-                max_x = sz as u32;
-            }
-        }
-        if let Some(&(_, sz)) = e.dims.get("Y") {
-            if sz as u32 > max_y {
-                max_y = sz as u32;
-            }
-        }
-        if let Some(&(start, _)) = e.dims.get("Z") {
-            if start > max_z {
-                max_z = start;
-            }
-        }
-        if let Some(&(start, _)) = e.dims.get("C") {
-            if start > max_c {
-                max_c = start;
-            }
-        }
-        if let Some(&(start, _)) = e.dims.get("T") {
-            if start > max_t {
-                max_t = start;
-            }
-        }
-    }
-
-    let (pt, s) = czi_pixel_type(pixel_type);
-    let spp = s;
-
-    Ok(CziParsed {
-        meta_xml,
-        entries,
-        width: max_x,
-        height: max_y,
-        z_count: (max_z + 1) as u32,
-        c_count: (max_c + 1) as u32,
-        t_count: (max_t + 1) as u32,
-        pixel_type: pt,
-        spp,
-    })
+    Ok(CziParsedFile { meta_xml, entries })
 }
-
-// ---- decompression ---------------------------------------------------------
 
 fn decompress_subblock(data: &[u8], compression: i32) -> Result<Vec<u8>> {
     match compression {
-        0 => Ok(data.to_vec()), // Uncompressed
+        0 => Ok(data.to_vec()),
         1 => {
-            // JPEG
             let mut dec = jpeg_decoder::Decoder::new(data);
             dec.decode()
                 .map_err(|e| BioFormatsError::Codec(e.to_string()))
         }
         2 => {
-            // LZW
             use weezl::{decode::Decoder, BitOrder};
             let mut dec = Decoder::with_tiff_size_switch(BitOrder::Msb, 8);
             dec.decode(data)
                 .map_err(|e| BioFormatsError::Codec(e.to_string()))
         }
-        4 => {
-            // JPEG-XR — not yet supported
-            Err(BioFormatsError::UnsupportedFormat(
-                "CZI: JPEG-XR compression not yet supported".into(),
-            ))
-        }
-        5 | 6 => {
-            // Zstd
-            zstd::decode_all(data).map_err(BioFormatsError::Io)
-        }
+        4 => Err(BioFormatsError::UnsupportedFormat(
+            "CZI: JPEG-XR compression not yet supported".into(),
+        )),
+        5 | 6 => zstd::decode_all(data).map_err(BioFormatsError::Io),
         _ => Err(BioFormatsError::UnsupportedFormat(format!(
             "CZI: unknown compression {}",
             compression
@@ -261,65 +244,566 @@ fn decompress_subblock(data: &[u8], compression: i32) -> Result<Vec<u8>> {
     }
 }
 
-// ---- reader ----------------------------------------------------------------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CziLocatedEntry {
+    file_index: usize,
+    entry: DirEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CziPlaneRef {
+    entry_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CziSeries {
+    metadata: ImageMetadata,
+    planes: Vec<CziPlaneRef>,
+    samples_per_pixel: u32,
+    bgr_order: bool,
+}
+
+#[derive(Debug, Default)]
+struct CziMetadataModel {
+    physical_size_x_um: Option<f64>,
+    physical_size_y_um: Option<f64>,
+    physical_size_z_um: Option<f64>,
+    time_increment_seconds: Option<f64>,
+    objective_model: Option<String>,
+    objective_na: Option<f64>,
+    objective_magnification: Option<f64>,
+    channel_metadata: Vec<ChannelMetadata>,
+    scene_positions: Vec<(Option<f64>, Option<f64>, Option<f64>)>,
+}
+
+fn child_element_text(node: Node<'_, '_>, child_name: &str) -> Option<String> {
+    node.children()
+        .find(|child| child.is_element() && child.tag_name().name() == child_name)
+        .and_then(|child| child.text())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+fn parse_f64(value: Option<&str>) -> Option<f64> {
+    value.and_then(|value| value.trim().parse::<f64>().ok())
+}
+
+fn parse_czi_metadata(xml: &str) -> CziMetadataModel {
+    let Ok(document) = Document::parse(xml) else {
+        return CziMetadataModel::default();
+    };
+
+    let mut metadata = CziMetadataModel::default();
+
+    for distance in document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "Distance")
+    {
+        let Some(id) = distance.attribute("Id") else {
+            continue;
+        };
+        let Some(value) =
+            child_element_text(distance, "Value").and_then(|value| value.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        let value_um = value * 1_000_000.0;
+        match id {
+            "X" if value_um > 0.0 => metadata.physical_size_x_um = Some(value_um),
+            "Y" if value_um > 0.0 => metadata.physical_size_y_um = Some(value_um),
+            "Z" if value_um > 0.0 => metadata.physical_size_z_um = Some(value_um),
+            _ => {}
+        }
+    }
+
+    metadata.time_increment_seconds = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "Increment")
+        .and_then(|node| node.text())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| *value > 0.0);
+
+    metadata.objective_model = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "Objective")
+        .and_then(|node| {
+            node.attribute("Model")
+                .map(str::to_owned)
+                .or_else(|| child_element_text(node, "Name"))
+        });
+    metadata.objective_na = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "Objective")
+        .and_then(|node| {
+            parse_f64(node.attribute("LensNA")).or_else(|| {
+                child_element_text(node, "LensNA").and_then(|value| value.parse::<f64>().ok())
+            })
+        });
+    metadata.objective_magnification = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "Objective")
+        .and_then(|node| {
+            parse_f64(node.attribute("NominalMagnification")).or_else(|| {
+                child_element_text(node, "NominalMagnification")
+                    .and_then(|value| value.parse::<f64>().ok())
+            })
+        });
+
+    metadata.channel_metadata = document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "Channel")
+        .map(|channel| ChannelMetadata {
+            name: channel
+                .attribute("Name")
+                .map(str::to_owned)
+                .or_else(|| child_element_text(channel, "Name")),
+            color: channel
+                .attribute("Color")
+                .and_then(|value| value.parse::<u32>().ok()),
+            emission_wavelength_nm: channel
+                .attribute("EmissionWavelength")
+                .and_then(|value| value.parse::<f64>().ok())
+                .or_else(|| {
+                    child_element_text(channel, "EmissionWavelength")
+                        .and_then(|value| value.parse::<f64>().ok())
+                }),
+            excitation_wavelength_nm: channel
+                .attribute("ExcitationWavelength")
+                .and_then(|value| value.parse::<f64>().ok())
+                .or_else(|| {
+                    child_element_text(channel, "ExcitationWavelength")
+                        .and_then(|value| value.parse::<f64>().ok())
+                }),
+        })
+        .collect();
+
+    for scene in document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "Scene")
+    {
+        let mut added = false;
+        for position in scene
+            .descendants()
+            .filter(|node| node.is_element() && node.tag_name().name() == "Position")
+        {
+            metadata.scene_positions.push((
+                position
+                    .attribute("X")
+                    .and_then(|value| value.parse::<f64>().ok()),
+                position
+                    .attribute("Y")
+                    .and_then(|value| value.parse::<f64>().ok()),
+                position
+                    .attribute("Z")
+                    .and_then(|value| value.parse::<f64>().ok()),
+            ));
+            added = true;
+        }
+        if !added {
+            if let Some(center) = scene
+                .descendants()
+                .find(|node| node.is_element() && node.tag_name().name() == "CenterPosition")
+                .and_then(|node| node.text())
+            {
+                let coords = center
+                    .split(',')
+                    .map(|value| value.trim().parse::<f64>().ok())
+                    .collect::<Vec<_>>();
+                metadata.scene_positions.push((
+                    coords.first().copied().flatten(),
+                    coords.get(1).copied().flatten(),
+                    coords.get(2).copied().flatten(),
+                ));
+            }
+        }
+    }
+
+    metadata
+}
+
+fn file_stem_without_part(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(
+        stem.strip_suffix(')')
+            .and_then(|value| value.rsplit_once(" ("))
+            .and_then(|(base, suffix)| suffix.parse::<usize>().ok().map(|_| base))
+            .unwrap_or(stem)
+            .to_string(),
+    )
+}
+
+fn czi_part_index(path: &Path) -> usize {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| {
+            stem.strip_suffix(')')
+                .and_then(|value| value.rsplit_once(" ("))
+                .and_then(|(_, suffix)| suffix.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn discover_czi_files(path: &Path) -> Vec<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let Some(base) = file_stem_without_part(path) else {
+        return vec![path.to_path_buf()];
+    };
+    let master = parent.join(format!("{base}.czi"));
+    let primary = if master.exists() {
+        master
+    } else {
+        path.to_path_buf()
+    };
+
+    let Ok(entries) = fs::read_dir(parent) else {
+        return vec![primary];
+    };
+
+    let mut files = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("czi"))
+                .unwrap_or(false)
+                && file_stem_without_part(candidate)
+                    .map(|candidate_base| candidate_base == base)
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    if !files.iter().any(|candidate| candidate == &primary) {
+        files.push(primary.clone());
+    }
+
+    files.sort_by(|left, right| {
+        let left_primary = *left == primary;
+        let right_primary = *right == primary;
+        right_primary
+            .cmp(&left_primary)
+            .then_with(|| czi_part_index(left).cmp(&czi_part_index(right)))
+            .then_with(|| left.cmp(right))
+    });
+    files
+}
+
+fn dim_start(entry: &DirEntry, key: &str) -> i32 {
+    entry.dims.get(key).map(|(start, _)| *start).unwrap_or(0)
+}
+
+fn dim_extent(entry: &DirEntry, key: &str) -> u32 {
+    entry
+        .dims
+        .get(key)
+        .map(|(start, size)| (*start + (*size).max(1)) as u32)
+        .unwrap_or(1)
+}
+
+fn dim_size(entry: &DirEntry, key: &str) -> u32 {
+    entry
+        .dims
+        .get(key)
+        .map(|(_, size)| (*size).max(1) as u32)
+        .unwrap_or(1)
+}
+
+fn plane_priority(entry: &DirEntry) -> (i64, bool) {
+    let area = dim_size(entry, "X") as i64 * dim_size(entry, "Y") as i64;
+    let origin = dim_start(entry, "X") == 0 && dim_start(entry, "Y") == 0;
+    (area, origin)
+}
+
+fn bgr_to_rgb_in_place(data: &mut [u8], samples_per_pixel: u32, bytes_per_sample: usize) {
+    if samples_per_pixel < 3 {
+        return;
+    }
+    let pixel_stride = samples_per_pixel as usize * bytes_per_sample;
+    let third_sample_offset = 2 * bytes_per_sample;
+    for pixel in data.chunks_exact_mut(pixel_stride) {
+        for offset in 0..bytes_per_sample {
+            pixel.swap(offset, third_sample_offset + offset);
+        }
+    }
+}
+
+fn build_czi_series(
+    entries: &[CziLocatedEntry],
+    metadata_xml: &str,
+    used_files: &[PathBuf],
+) -> Result<Vec<CziSeries>> {
+    if entries.is_empty() {
+        return Err(BioFormatsError::Format(
+            "CZI dataset contained no readable subblocks".into(),
+        ));
+    }
+
+    let xml = parse_czi_metadata(metadata_xml);
+    let mut grouped = BTreeMap::<(i32, i32, i32, i32), Vec<usize>>::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let key = (
+            dim_start(&entry.entry, "S"),
+            dim_start(&entry.entry, "B"),
+            dim_start(&entry.entry, "V"),
+            dim_start(&entry.entry, "M"),
+        );
+        grouped.entry(key).or_default().push(index);
+    }
+
+    let mut series = Vec::new();
+    for ((scene_index, _, _, _), group) in grouped {
+        let first_entry = &entries[group[0]].entry;
+        let pixel = czi_pixel_info(first_entry.pixel_type);
+        let logical_channels = group
+            .iter()
+            .map(|index| dim_extent(&entries[*index].entry, "C"))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let size_z = group
+            .iter()
+            .map(|index| dim_extent(&entries[*index].entry, "Z"))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let size_t = group
+            .iter()
+            .map(|index| dim_extent(&entries[*index].entry, "T"))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let size_x = group
+            .iter()
+            .map(|index| dim_size(&entries[*index].entry, "X"))
+            .max()
+            .unwrap_or(0);
+        let size_y = group
+            .iter()
+            .map(|index| dim_size(&entries[*index].entry, "Y"))
+            .max()
+            .unwrap_or(0);
+        let image_count = logical_channels
+            .saturating_mul(size_z)
+            .saturating_mul(size_t);
+
+        let mut metadata = ImageMetadata {
+            size_x,
+            size_y,
+            size_z,
+            size_c: logical_channels.saturating_mul(if pixel.rgb {
+                pixel.samples_per_pixel
+            } else {
+                1
+            }),
+            size_t,
+            pixel_type: pixel.pixel_type,
+            bits_per_pixel: (pixel.pixel_type.bytes_per_sample() * 8) as u8,
+            image_count,
+            dimension_order: DimensionOrder::XYZCT,
+            is_rgb: pixel.rgb,
+            is_interleaved: pixel.rgb,
+            is_indexed: false,
+            is_false_color: true,
+            is_little_endian: true,
+            resolution_count: 1,
+            series_metadata: HashMap::new(),
+            lookup_table: None,
+            physical_size_x_um: xml.physical_size_x_um,
+            physical_size_y_um: xml.physical_size_y_um,
+            physical_size_z_um: xml.physical_size_z_um,
+            time_increment_seconds: xml.time_increment_seconds,
+            acquisition_timestamp: None,
+            objective_model: xml.objective_model.clone(),
+            objective_magnification: xml.objective_magnification,
+            objective_na: xml.objective_na,
+            channel_metadata: if xml.channel_metadata.len() >= logical_channels as usize {
+                xml.channel_metadata[..logical_channels as usize].to_vec()
+            } else {
+                xml.channel_metadata.clone()
+            },
+            plane_metadata: Vec::new(),
+            used_files: used_files.to_vec(),
+        };
+        metadata.series_metadata.insert(
+            "czi_subblocks".into(),
+            MetadataValue::Int(group.len() as i64),
+        );
+        metadata.series_metadata.insert(
+            "czi_scene_index".into(),
+            MetadataValue::Int(scene_index as i64),
+        );
+
+        let temp = ImageMetadata {
+            size_z,
+            size_c: logical_channels,
+            size_t,
+            image_count,
+            dimension_order: DimensionOrder::XYZCT,
+            ..ImageMetadata::default()
+        };
+        let mut planes: Vec<Option<usize>> = vec![None; image_count as usize];
+        for index in &group {
+            let entry = &entries[*index].entry;
+            let z = dim_start(entry, "Z").max(0) as u32;
+            let c = dim_start(entry, "C").max(0) as u32;
+            let t = dim_start(entry, "T").max(0) as u32;
+            let plane_index = temp.get_index(z, c, t) as usize;
+            if plane_index >= planes.len() {
+                continue;
+            }
+            match planes[plane_index] {
+                Some(current) => {
+                    let current_entry = &entries[current].entry;
+                    if plane_priority(entry) > plane_priority(current_entry) {
+                        planes[plane_index] = Some(*index);
+                    }
+                }
+                None => planes[plane_index] = Some(*index),
+            }
+        }
+
+        let scene_position = usize::try_from(scene_index)
+            .ok()
+            .and_then(|index| xml.scene_positions.get(index).copied())
+            .unwrap_or((None, None, None));
+
+        metadata.plane_metadata = (0..image_count)
+            .map(|plane_index| {
+                let (z, c, t) = temp.get_zct_coords(plane_index);
+                PlaneMetadata {
+                    z,
+                    c,
+                    t,
+                    delta_t_seconds: metadata.time_increment_seconds.map(|step| step * t as f64),
+                    position_x_um: scene_position.0,
+                    position_y_um: scene_position.1,
+                    position_z_um: scene_position
+                        .2
+                        .or_else(|| metadata.physical_size_z_um.map(|step| step * z as f64)),
+                }
+            })
+            .collect();
+
+        let planes = planes
+            .into_iter()
+            .enumerate()
+            .map(|(plane_index, entry_index)| {
+                entry_index
+                    .map(|entry_index| CziPlaneRef { entry_index })
+                    .ok_or_else(|| {
+                        BioFormatsError::Format(format!(
+                            "CZI series plane {} could not be mapped",
+                            plane_index
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        series.push(CziSeries {
+            metadata,
+            planes,
+            samples_per_pixel: pixel.samples_per_pixel,
+            bgr_order: pixel.bgr_order,
+        });
+    }
+
+    Ok(series)
+}
 
 pub struct CziReader {
     path: Option<PathBuf>,
-    meta: Option<ImageMetadata>,
-    entries: Vec<DirEntry>,
+    used_files: Vec<PathBuf>,
+    entries: Vec<CziLocatedEntry>,
     meta_xml: String,
+    series: Vec<CziSeries>,
+    current_series: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CziReaderSnapshot {
     pub path: PathBuf,
-    pub meta: ImageMetadata,
-    pub entries: Vec<DirEntry>,
+    pub used_files: Vec<PathBuf>,
+    pub entries: Vec<CziLocatedEntry>,
     pub meta_xml: String,
+    pub series: Vec<CziSeries>,
+    pub current_series: usize,
 }
 
 impl CziReader {
     pub fn new() -> Self {
-        CziReader {
+        Self {
             path: None,
-            meta: None,
+            used_files: Vec::new(),
             entries: Vec::new(),
             meta_xml: String::new(),
+            series: Vec::new(),
+            current_series: 0,
         }
     }
 
     pub fn from_snapshot(snapshot: CziReaderSnapshot) -> Result<Self> {
         Ok(Self {
             path: Some(snapshot.path),
-            meta: Some(snapshot.meta),
+            used_files: snapshot.used_files,
             entries: snapshot.entries,
             meta_xml: snapshot.meta_xml,
+            series: snapshot.series,
+            current_series: snapshot.current_series,
         })
     }
 
-    fn find_entry(&self, plane_index: u32) -> Option<&DirEntry> {
-        // Map plane_index to (z, c, t) using XYCZT ordering, then find matching entry
-        let meta = self.meta.as_ref()?;
-        let sz = meta.size_z;
-        let sc = meta.size_c;
-        let z = plane_index % sz;
-        let c = (plane_index / sz) % sc;
-        let t = plane_index / (sz * sc);
+    fn current_series(&self) -> Result<&CziSeries> {
+        self.series
+            .get(self.current_series)
+            .ok_or(BioFormatsError::NotInitialized)
+    }
 
-        self.entries.iter().find(|e| {
-            e.dims
-                .get("Z")
-                .map(|&(s, _)| s as u32 == z)
-                .unwrap_or(z == 0)
-                && e.dims
-                    .get("C")
-                    .map(|&(s, _)| s as u32 == c)
-                    .unwrap_or(c == 0)
-                && e.dims
-                    .get("T")
-                    .map(|&(s, _)| s as u32 == t)
-                    .unwrap_or(t == 0)
-        })
+    fn read_plane(&self, plane: &CziPlaneRef, series: &CziSeries) -> Result<Vec<u8>> {
+        let located = self
+            .entries
+            .get(plane.entry_index)
+            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane.entry_index as u32))?;
+        let path = self
+            .used_files
+            .get(located.file_index)
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+
+        file.seek(SeekFrom::Start(located.entry.file_position as u64))
+            .map_err(BioFormatsError::Io)?;
+        let mut seg_hdr = vec![0u8; SEG_HEADER];
+        file.read_exact(&mut seg_hdr).map_err(BioFormatsError::Io)?;
+        let mut subblock_hdr = vec![0u8; 16];
+        file.read_exact(&mut subblock_hdr)
+            .map_err(BioFormatsError::Io)?;
+        let metadata_size = read_i32(&subblock_hdr, 0) as i64;
+        let attach_size = read_i32(&subblock_hdr, 4) as i64;
+        let data_size = read_u64(&subblock_hdr, 8) as usize;
+
+        file.seek(SeekFrom::Current(256 + metadata_size + attach_size))
+            .map_err(BioFormatsError::Io)?;
+
+        let mut compressed = vec![0u8; data_size];
+        file.read_exact(&mut compressed)
+            .map_err(BioFormatsError::Io)?;
+        let mut raw = decompress_subblock(&compressed, located.entry.compression)?;
+
+        let expected = series.metadata.size_x as usize
+            * series.metadata.size_y as usize
+            * series.samples_per_pixel as usize
+            * series.metadata.pixel_type.bytes_per_sample();
+        raw.truncate(expected);
+        raw.resize(expected, 0);
+        if series.bgr_order {
+            bgr_to_rgb_in_place(
+                &mut raw,
+                series.samples_per_pixel,
+                series.metadata.pixel_type.bytes_per_sample(),
+            );
+        }
+        Ok(raw)
     }
 }
 
@@ -332,8 +816,8 @@ impl Default for CziReader {
 impl FormatReader for CziReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.eq_ignore_ascii_case("czi"))
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("czi"))
             .unwrap_or(false)
     }
 
@@ -342,129 +826,84 @@ impl FormatReader for CziReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let f = File::open(path).map_err(BioFormatsError::Io)?;
-        let mut reader = BufReader::new(f);
-        let parsed = parse_czi_file(&mut reader).map_err(BioFormatsError::Io)?;
+        let used_files = discover_czi_files(path);
+        let mut entries = Vec::new();
+        let mut meta_xml = String::new();
 
-        let image_count = parsed.z_count * parsed.c_count * parsed.t_count;
-        let bps = (parsed.pixel_type.bytes_per_sample() * 8) as u8;
-        let is_rgb = parsed.spp >= 3;
+        for (file_index, file_path) in used_files.iter().enumerate() {
+            let file = File::open(file_path).map_err(BioFormatsError::Io)?;
+            let mut reader = BufReader::new(file);
+            let parsed = parse_czi_file(&mut reader).map_err(BioFormatsError::Io)?;
+            if meta_xml.is_empty() && !parsed.meta_xml.trim().is_empty() {
+                meta_xml = parsed.meta_xml.clone();
+            }
+            entries.extend(
+                parsed
+                    .entries
+                    .into_iter()
+                    .map(|entry| CziLocatedEntry { file_index, entry }),
+            );
+        }
 
-        let mut series_metadata: HashMap<String, MetadataValue> = HashMap::new();
-        series_metadata.insert(
-            "czi_subblocks".into(),
-            MetadataValue::Int(parsed.entries.len() as i64),
-        );
-
-        self.meta = Some(ImageMetadata {
-            size_x: parsed.width,
-            size_y: parsed.height,
-            size_z: parsed.z_count,
-            size_c: if is_rgb {
-                parsed.c_count * parsed.spp
-            } else {
-                parsed.c_count
-            },
-            size_t: parsed.t_count,
-            pixel_type: parsed.pixel_type,
-            bits_per_pixel: bps,
-            image_count,
-            dimension_order: DimensionOrder::XYZCT,
-            is_rgb,
-            is_interleaved: true,
-            is_indexed: false,
-            is_false_color: true,
-            is_little_endian: true,
-            resolution_count: 1,
-            series_metadata,
-            lookup_table: None,
-            ..ImageMetadata::default()
-        });
-        self.entries = parsed.entries;
-        self.meta_xml = parsed.meta_xml;
-        self.path = Some(path.to_path_buf());
+        let series = build_czi_series(&entries, &meta_xml, &used_files)?;
+        self.path = Some(used_files[0].clone());
+        self.used_files = used_files;
+        self.entries = entries;
+        self.meta_xml = meta_xml;
+        self.series = series;
+        self.current_series = 0;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
         self.path = None;
-        self.meta = None;
+        self.used_files.clear();
         self.entries.clear();
         self.meta_xml.clear();
+        self.series.clear();
+        self.current_series = 0;
         Ok(())
     }
 
     fn series_count(&self) -> usize {
-        1
+        self.series.len().max(1)
     }
-    fn set_series(&mut self, s: usize) -> Result<()> {
-        if s != 0 {
-            Err(BioFormatsError::SeriesOutOfRange(s))
-        } else {
-            Ok(())
+
+    fn set_series(&mut self, series: usize) -> Result<()> {
+        if series >= self.series.len() {
+            return Err(BioFormatsError::SeriesOutOfRange(series));
         }
+        self.current_series = series;
+        Ok(())
     }
+
     fn series(&self) -> usize {
-        0
+        self.current_series
     }
+
     fn metadata(&self) -> &ImageMetadata {
-        self.meta.as_ref().expect("set_id not called")
+        &self
+            .series
+            .get(self.current_series)
+            .expect("set_id not called")
+            .metadata
     }
 
     fn current_file(&self) -> Option<&Path> {
         self.path.as_deref()
     }
 
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.used_files.clone()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        if plane_index >= meta.image_count {
+        let series = self.current_series()?;
+        if plane_index >= series.metadata.image_count {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
         }
-
-        let entry = self
-            .find_entry(plane_index)
-            .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane_index))?;
-        let file_pos = entry.file_position as u64;
-        let compression = entry.compression;
-
-        let path = self.path.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-
-        // Each subblock segment: 32-byte seg header, then SubBlockData header
-        f.seek(SeekFrom::Start(file_pos))
-            .map_err(BioFormatsError::Io)?;
-        let mut seg_hdr = vec![0u8; SEG_HEADER];
-        f.read_exact(&mut seg_hdr).map_err(BioFormatsError::Io)?;
-        let used_size = read_u64(&seg_hdr, 24);
-
-        // SubBlock data header: metadata_size(i32) + attach_size(i32) + data_size(i64) + dir_entry(256)
-        let mut sb_hdr = vec![0u8; 16];
-        f.read_exact(&mut sb_hdr).map_err(BioFormatsError::Io)?;
-        let metadata_size = read_i32(&sb_hdr, 0) as u64;
-        let attach_size = read_i32(&sb_hdr, 4) as u64;
-        let data_size = read_u64(&sb_hdr, 8);
-
-        // Skip DirectoryEntry (256 bytes) + metadata + attachment
-        f.seek(SeekFrom::Current(
-            256 + metadata_size as i64 + attach_size as i64,
-        ))
-        .map_err(BioFormatsError::Io)?;
-
-        let mut compressed = vec![0u8; data_size as usize];
-        f.read_exact(&mut compressed).map_err(BioFormatsError::Io)?;
-
-        let raw = decompress_subblock(&compressed, compression)?;
-
-        // Trim/pad to expected plane size
-        let bps = meta.pixel_type.bytes_per_sample();
-        let expected = meta.size_x as usize * meta.size_y as usize * meta.spp() * bps;
-        let _ = (used_size, attach_size);
-        let mut out = raw;
-        out.truncate(expected);
-        while out.len() < expected {
-            out.push(0);
-        }
-        Ok(out)
+        let plane = &series.planes[plane_index as usize];
+        self.read_plane(plane, series)
     }
 
     fn open_bytes_region(
@@ -476,47 +915,213 @@ impl FormatReader for CziReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         let full = self.open_bytes(plane_index)?;
-        let meta = self.meta.as_ref().unwrap();
-        let spp = meta.spp();
-        let bps = meta.pixel_type.bytes_per_sample();
-        let row_bytes = meta.size_x as usize * spp * bps;
-        let out_row = w as usize * spp * bps;
+        let series = self.current_series()?;
+        let samples = series.samples_per_pixel as usize;
+        let bytes_per_sample = series.metadata.pixel_type.bytes_per_sample();
+        let row_bytes = series.metadata.size_x as usize * samples * bytes_per_sample;
+        let out_row = w as usize * samples * bytes_per_sample;
         let mut out = Vec::with_capacity(h as usize * out_row);
         for row in 0..h as usize {
             let src = &full[(y as usize + row) * row_bytes..];
-            let s = x as usize * spp * bps;
-            out.extend_from_slice(&src[s..s + out_row]);
+            let start = x as usize * samples * bytes_per_sample;
+            out.extend_from_slice(&src[start..start + out_row]);
         }
         Ok(out)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
-        let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
-        let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
-        self.open_bytes_region(plane_index, tx, ty, tw, th)
+        let metadata = &self.current_series()?.metadata;
+        let (thumb_w, thumb_h) = (metadata.size_x.min(256), metadata.size_y.min(256));
+        let (thumb_x, thumb_y) = (
+            (metadata.size_x - thumb_w) / 2,
+            (metadata.size_y - thumb_h) / 2,
+        );
+        self.open_bytes_region(plane_index, thumb_x, thumb_y, thumb_w, thumb_h)
     }
 
     fn snapshot(&self) -> Result<ReaderSnapshot> {
         Ok(ReaderSnapshot::CziReader(CziReaderSnapshot {
             path: self.path.clone().ok_or(BioFormatsError::NotInitialized)?,
-            meta: self.meta.clone().ok_or(BioFormatsError::NotInitialized)?,
+            used_files: self.used_files.clone(),
             entries: self.entries.clone(),
             meta_xml: self.meta_xml.clone(),
+            series: self.series.clone(),
+            current_series: self.current_series,
         }))
     }
 }
 
-// Helper: samples per pixel from ImageMetadata
-trait SppExt {
-    fn spp(&self) -> usize;
-}
-impl SppExt for ImageMetadata {
-    fn spp(&self) -> usize {
-        if self.is_rgb {
-            self.size_c as usize
-        } else {
-            1
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("bioformats_rs_{name}_{nanos}"));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
         }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn entry(pixel_type: i32, dims: &[(&str, (i32, i32))]) -> CziLocatedEntry {
+        CziLocatedEntry {
+            file_index: 0,
+            entry: DirEntry {
+                pixel_type,
+                file_position: 0,
+                compression: 0,
+                dims: dims
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), *value))
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn swaps_bgr_to_rgb() {
+        let mut pixels = vec![1u8, 2, 3, 10, 20, 30];
+        bgr_to_rgb_in_place(&mut pixels, 3, 1);
+        assert_eq!(pixels, vec![3, 2, 1, 30, 20, 10]);
+    }
+
+    #[test]
+    fn discovers_master_and_parts() {
+        let dir = TempDir::new("czi_parts");
+        let master = dir.path.join("sample.czi");
+        let part2 = dir.path.join("sample (2).czi");
+        let part1 = dir.path.join("sample (1).czi");
+        fs::write(&master, []).unwrap();
+        fs::write(&part2, []).unwrap();
+        fs::write(&part1, []).unwrap();
+
+        let files = discover_czi_files(&part1);
+        assert_eq!(files, vec![master, part1, part2]);
+    }
+
+    #[test]
+    fn builds_series_with_logical_channels() {
+        let xml = r#"
+<ImageDocument>
+  <Metadata>
+    <Scaling>
+      <Items>
+        <Distance Id="X"><Value>0.0000005</Value></Distance>
+        <Distance Id="Y"><Value>0.0000006</Value></Distance>
+      </Items>
+    </Scaling>
+    <Information>
+      <Image>
+        <Dimensions>
+          <T><Positions><Interval><Increment>2.5</Increment></Interval></Positions></T>
+          <S>
+            <Scenes>
+              <Scene><CenterPosition>1.0,2.0,3.0</CenterPosition></Scene>
+              <Scene><CenterPosition>4.0,5.0,6.0</CenterPosition></Scene>
+            </Scenes>
+          </S>
+          <Channels>
+            <Channel Name="GFP"><EmissionWavelength>520</EmissionWavelength></Channel>
+            <Channel Name="RFP"><EmissionWavelength>610</EmissionWavelength></Channel>
+          </Channels>
+        </Dimensions>
+      </Image>
+      <Instrument>
+        <Objectives>
+          <Objective Model="Plan-Apo"><LensNA>1.4</LensNA></Objective>
+        </Objectives>
+      </Instrument>
+    </Information>
+  </Metadata>
+</ImageDocument>
+"#;
+        let entries = vec![
+            entry(
+                3,
+                &[
+                    ("S", (0, 1)),
+                    ("C", (0, 1)),
+                    ("Z", (0, 1)),
+                    ("T", (0, 1)),
+                    ("X", (0, 8)),
+                    ("Y", (0, 6)),
+                ],
+            ),
+            entry(
+                3,
+                &[
+                    ("S", (0, 1)),
+                    ("C", (1, 1)),
+                    ("Z", (0, 1)),
+                    ("T", (0, 1)),
+                    ("X", (0, 8)),
+                    ("Y", (0, 6)),
+                ],
+            ),
+            entry(
+                3,
+                &[
+                    ("S", (1, 1)),
+                    ("C", (0, 1)),
+                    ("Z", (0, 1)),
+                    ("T", (0, 1)),
+                    ("X", (0, 8)),
+                    ("Y", (0, 6)),
+                ],
+            ),
+            entry(
+                3,
+                &[
+                    ("S", (1, 1)),
+                    ("C", (1, 1)),
+                    ("Z", (0, 1)),
+                    ("T", (0, 1)),
+                    ("X", (0, 8)),
+                    ("Y", (0, 6)),
+                ],
+            ),
+        ];
+
+        let series = build_czi_series(&entries, xml, &[PathBuf::from("sample.czi")]).unwrap();
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[0].metadata.size_c, 6);
+        assert_eq!(series[0].metadata.logical_channel_count(), 2);
+        assert_eq!(series[0].metadata.image_count, 2);
+        assert!(series[0].metadata.is_rgb);
+        assert_eq!(
+            series[0].metadata.channel_metadata[0].name.as_deref(),
+            Some("GFP")
+        );
+        assert_eq!(series[0].metadata.physical_size_x_um, Some(0.5));
+        assert_eq!(series[0].metadata.physical_size_y_um, Some(0.6));
+        assert_eq!(series[0].metadata.time_increment_seconds, Some(2.5));
+        assert_eq!(
+            series[0].metadata.objective_model.as_deref(),
+            Some("Plan-Apo")
+        );
+        assert_eq!(series[0].metadata.objective_na, Some(1.4));
+        assert_eq!(
+            series[0].metadata.plane_metadata[0].position_x_um,
+            Some(1.0)
+        );
+        assert_eq!(
+            series[1].metadata.plane_metadata[0].position_x_um,
+            Some(4.0)
+        );
     }
 }
