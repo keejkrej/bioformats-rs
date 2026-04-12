@@ -1,6 +1,7 @@
 use super::pixel_type::PixelType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Dimension ordering of the image planes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +83,27 @@ pub struct LookupTable {
     pub blue: Vec<u16>,
 }
 
+/// Optional per-channel metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChannelMetadata {
+    pub name: Option<String>,
+    pub color: Option<u32>,
+    pub emission_wavelength_nm: Option<f64>,
+    pub excitation_wavelength_nm: Option<f64>,
+}
+
+/// Optional per-plane metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PlaneMetadata {
+    pub z: u32,
+    pub c: u32,
+    pub t: u32,
+    pub delta_t_seconds: Option<f64>,
+    pub position_x_um: Option<f64>,
+    pub position_y_um: Option<f64>,
+    pub position_z_um: Option<f64>,
+}
+
 /// Core metadata for one image series.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMetadata {
@@ -102,6 +124,17 @@ pub struct ImageMetadata {
     pub resolution_count: u32,
     pub series_metadata: HashMap<String, MetadataValue>,
     pub lookup_table: Option<LookupTable>,
+    pub physical_size_x_um: Option<f64>,
+    pub physical_size_y_um: Option<f64>,
+    pub physical_size_z_um: Option<f64>,
+    pub time_increment_seconds: Option<f64>,
+    pub acquisition_timestamp: Option<String>,
+    pub objective_model: Option<String>,
+    pub objective_magnification: Option<f64>,
+    pub objective_na: Option<f64>,
+    pub channel_metadata: Vec<ChannelMetadata>,
+    pub plane_metadata: Vec<PlaneMetadata>,
+    pub used_files: Vec<PathBuf>,
 }
 
 impl Default for ImageMetadata {
@@ -124,6 +157,17 @@ impl Default for ImageMetadata {
             resolution_count: 1,
             series_metadata: HashMap::new(),
             lookup_table: None,
+            physical_size_x_um: None,
+            physical_size_y_um: None,
+            physical_size_z_um: None,
+            time_increment_seconds: None,
+            acquisition_timestamp: None,
+            objective_model: None,
+            objective_magnification: None,
+            objective_na: None,
+            channel_metadata: Vec::new(),
+            plane_metadata: Vec::new(),
+            used_files: Vec::new(),
         }
     }
 }

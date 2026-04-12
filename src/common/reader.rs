@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::common::error::Result;
 use crate::common::metadata::{ImageMetadata, LookupTable};
@@ -19,6 +19,11 @@ pub trait FormatReader: Send + Sync {
     }
     fn current_file(&self) -> Option<&Path> {
         None
+    }
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.current_file()
+            .map(|path| vec![path.to_path_buf()])
+            .unwrap_or_default()
     }
     fn image_count(&self) -> u32 {
         self.metadata().image_count
@@ -88,6 +93,12 @@ pub trait FormatReader: Send + Sync {
     }
     fn resolution_count(&self) -> usize {
         1
+    }
+    fn set_flattened_resolutions(&mut self, _flattened: bool) -> Result<()> {
+        Ok(())
+    }
+    fn flattened_resolutions(&self) -> bool {
+        true
     }
     fn set_resolution(&mut self, _level: usize) -> Result<()> {
         Ok(())

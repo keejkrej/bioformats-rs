@@ -70,7 +70,7 @@ impl ReaderSnapshot {
                 snapshot.current_path = path.to_path_buf();
                 snapshot.inner.retarget_path(path);
             }
-            ReaderSnapshot::TiffReader(snapshot) => snapshot.path = path.to_path_buf(),
+            ReaderSnapshot::TiffReader(snapshot) => snapshot.retarget_primary_path(path),
             ReaderSnapshot::Nd2Reader(snapshot) => snapshot.path = path.to_path_buf(),
             ReaderSnapshot::CziReader(snapshot) => snapshot.path = path.to_path_buf(),
             ReaderSnapshot::ChannelSeparator(snapshot) => snapshot.inner.retarget_path(path),

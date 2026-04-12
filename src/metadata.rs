@@ -1,1 +1,3 @@
-pub use crate::common::metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
+pub use crate::common::metadata::{
+    ChannelMetadata, DimensionOrder, ImageMetadata, LookupTable, MetadataValue, PlaneMetadata,
+};

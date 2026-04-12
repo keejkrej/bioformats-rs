@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -389,6 +389,10 @@ impl FormatReader for MinMaxCalculator {
         self.reader.current_file()
     }
 
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.reader.used_files()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let bytes = self.reader.open_bytes(plane_index)?;
         self.update_min_max(plane_index, &bytes, true)?;
@@ -415,6 +419,16 @@ impl FormatReader for MinMaxCalculator {
 
     fn resolution_count(&self) -> usize {
         self.reader.resolution_count()
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        self.reader.set_flattened_resolutions(flattened)?;
+        self.refresh_series_state();
+        Ok(())
+    }
+
+    fn flattened_resolutions(&self) -> bool {
+        self.reader.flattened_resolutions()
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {

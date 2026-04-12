@@ -268,6 +268,7 @@ impl FormatReader for Nd2Reader {
             resolution_count: 1,
             series_metadata,
             lookup_table: None,
+            ..ImageMetadata::default()
         });
         self.image_chunks = image_chunks;
         self.chunks = chunks;

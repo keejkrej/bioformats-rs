@@ -358,6 +358,10 @@ impl FormatReader for FileStitcher {
         self.current_path.as_deref()
     }
 
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.file_paths.clone()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let (file_index, inner_index) = self.plane_mapping(plane_index)?;
         self.underlying_readers[file_index].open_bytes(inner_index)

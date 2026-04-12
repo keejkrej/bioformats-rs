@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
@@ -133,6 +133,14 @@ impl FormatReader for DimensionSwapper {
         &self.metadata
     }
 
+    fn current_file(&self) -> Option<&Path> {
+        self.reader.current_file()
+    }
+
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.reader.used_files()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         if plane_index >= self.image_count() {
             return Err(BioFormatsError::PlaneOutOfRange(plane_index));
@@ -165,6 +173,14 @@ impl FormatReader for DimensionSwapper {
 
     fn resolution_count(&self) -> usize {
         self.reader.resolution_count()
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        self.reader.set_flattened_resolutions(flattened)
+    }
+
+    fn flattened_resolutions(&self) -> bool {
+        self.reader.flattened_resolutions()
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {

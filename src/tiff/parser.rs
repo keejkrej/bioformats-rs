@@ -14,6 +14,7 @@ pub enum TiffVariant {
 }
 
 /// Parsed state of the TIFF stream header.
+#[derive(Debug)]
 pub struct TiffParser<R: Read + Seek> {
     pub reader: R,
     pub little_endian: bool,

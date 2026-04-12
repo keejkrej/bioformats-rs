@@ -27,7 +27,9 @@ pub mod tiff;
 pub mod wrappers;
 
 pub use error::{BioFormatsError, Result};
-pub use metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
+pub use metadata::{
+    ChannelMetadata, DimensionOrder, ImageMetadata, LookupTable, MetadataValue, PlaneMetadata,
+};
 pub use pattern::{AxisGuesser, AxisType, FilePattern, FilePatternBlock};
 pub use pixel::PixelType;
 pub use reader::FormatReader;

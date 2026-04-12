@@ -378,6 +378,7 @@ impl FormatReader for CziReader {
             resolution_count: 1,
             series_metadata,
             lookup_table: None,
+            ..ImageMetadata::default()
         });
         self.entries = parsed.entries;
         self.meta_xml = parsed.meta_xml;

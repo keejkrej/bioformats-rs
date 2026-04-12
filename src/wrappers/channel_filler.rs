@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{ImageMetadata, LookupTable};
@@ -208,6 +208,10 @@ impl FormatReader for ChannelFiller {
         self.reader.current_file()
     }
 
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.reader.used_files()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.open_bytes_region(plane_index, 0, 0, self.size_x(), self.size_y())
     }
@@ -252,6 +256,14 @@ impl FormatReader for ChannelFiller {
 
     fn resolution_count(&self) -> usize {
         self.reader.resolution_count()
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        self.reader.set_flattened_resolutions(flattened)
+    }
+
+    fn flattened_resolutions(&self) -> bool {
+        self.reader.flattened_resolutions()
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {

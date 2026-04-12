@@ -106,10 +106,26 @@ impl ImageReader {
         self.inner().expect("ImageReader not initialized").series()
     }
 
+    pub fn used_files(&self) -> Vec<PathBuf> {
+        self.inner()
+            .expect("ImageReader not initialized")
+            .used_files()
+    }
+
     pub fn resolution_count(&self) -> usize {
         self.inner()
             .expect("ImageReader not initialized")
             .resolution_count()
+    }
+
+    pub fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        self.inner_mut()?.set_flattened_resolutions(flattened)
+    }
+
+    pub fn flattened_resolutions(&self) -> bool {
+        self.inner()
+            .expect("ImageReader not initialized")
+            .flattened_resolutions()
     }
 
     pub fn set_resolution(&mut self, level: usize) -> Result<()> {
@@ -199,6 +215,12 @@ impl FormatReader for ImageReader {
         self.current_path.as_deref()
     }
 
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.inner()
+            .map(|inner| inner.used_files())
+            .unwrap_or_default()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner_mut()?.open_bytes(plane_index)
     }
@@ -222,6 +244,16 @@ impl FormatReader for ImageReader {
         self.inner()
             .expect("ImageReader not initialized")
             .resolution_count()
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        self.inner_mut()?.set_flattened_resolutions(flattened)
+    }
+
+    fn flattened_resolutions(&self) -> bool {
+        self.inner()
+            .expect("ImageReader not initialized")
+            .flattened_resolutions()
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {
