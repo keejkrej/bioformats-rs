@@ -1,0 +1,18 @@
+[package]
+name = "bioformats-rs"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "Direct Rust port of selected Bio-Formats readers"
+
+[lib]
+name = "bioformats_rs"
+path = "src/lib.rs"
+
+[dependencies]
+byteorder = "1.5"
+flate2 = "1.0"
+jpeg-decoder = "0.3"
+thiserror = "1.0"
+weezl = "0.1"
+zstd = "0.13"
