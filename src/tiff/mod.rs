@@ -1,6 +1,6 @@
 mod compression;
 pub mod ifd;
 pub mod parser;
-mod reader;
+pub(crate) mod reader;
 
-pub use reader::TiffReader;
+pub use reader::{TiffReader, TiffReaderSnapshot};

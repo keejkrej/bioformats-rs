@@ -69,6 +69,10 @@ impl FormatReader for SyntheticReader {
     fn open_thumb_bytes(&mut self, plane_index: u32) -> bioformats_rs::Result<Vec<u8>> {
         self.open_bytes(plane_index)
     }
+
+    fn clone_boxed(&self) -> bioformats_rs::Result<Box<dyn FormatReader>> {
+        Ok(Box::new(self.clone()))
+    }
 }
 
 #[test]

@@ -18,16 +18,23 @@ pub mod common;
 pub mod error;
 pub mod formats;
 pub mod metadata;
+pub mod pattern;
 pub mod pixel;
 pub mod reader;
 pub mod registry;
+pub mod snapshot;
 pub mod tiff;
 pub mod wrappers;
 
 pub use error::{BioFormatsError, Result};
 pub use metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
+pub use pattern::{AxisGuesser, AxisType, FilePattern, FilePatternBlock};
 pub use pixel::PixelType;
 pub use reader::FormatReader;
 pub use registry::ImageReader;
+pub use snapshot::ReaderSnapshot;
 pub use tiff::TiffReader;
-pub use wrappers::{ChannelMerger, ChannelSeparator, DimensionSwapper, ReaderWrapper};
+pub use wrappers::{
+    ChannelFiller, ChannelMerger, ChannelSeparator, DimensionSwapper, FileStitcher,
+    FileStitcherSnapshot, Memoizer, MinMaxCalculator, MinMaxStore, ReaderWrapper,
+};

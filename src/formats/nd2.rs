@@ -20,12 +20,14 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::snapshot::ReaderSnapshot;
+use serde::{Deserialize, Serialize};
 
 /// ND2 file magic bytes.
 pub const ND2_MAGIC: [u8; 4] = [0xDA, 0xCE, 0xBE, 0x0A];
 
-#[derive(Debug, Clone)]
-struct Nd2Chunk {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Nd2Chunk {
     name: String,
     data_offset: u64,
     data_length: u64,
@@ -123,6 +125,14 @@ pub struct Nd2Reader {
     image_chunks: Vec<usize>, // indices into chunks[] for ImageDataSeq chunks
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Nd2ReaderSnapshot {
+    pub path: PathBuf,
+    pub chunks: Vec<Nd2Chunk>,
+    pub meta: ImageMetadata,
+    pub image_chunks: Vec<usize>,
+}
+
 impl Nd2Reader {
     pub fn new() -> Self {
         Nd2Reader {
@@ -132,6 +142,17 @@ impl Nd2Reader {
             meta: None,
             image_chunks: Vec::new(),
         }
+    }
+
+    pub fn from_snapshot(snapshot: Nd2ReaderSnapshot) -> Result<Self> {
+        let f = File::open(&snapshot.path).map_err(BioFormatsError::Io)?;
+        Ok(Self {
+            file: Some(BufReader::new(f)),
+            path: Some(snapshot.path),
+            chunks: snapshot.chunks,
+            meta: Some(snapshot.meta),
+            image_chunks: snapshot.image_chunks,
+        })
     }
 }
 
@@ -281,6 +302,10 @@ impl FormatReader for Nd2Reader {
         self.meta.as_ref().expect("set_id not called")
     }
 
+    fn current_file(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
@@ -353,5 +378,14 @@ impl FormatReader for Nd2Reader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn snapshot(&self) -> Result<ReaderSnapshot> {
+        Ok(ReaderSnapshot::Nd2Reader(Nd2ReaderSnapshot {
+            path: self.path.clone().ok_or(BioFormatsError::NotInitialized)?,
+            chunks: self.chunks.clone(),
+            meta: self.meta.clone().ok_or(BioFormatsError::NotInitialized)?,
+            image_chunks: self.image_chunks.clone(),
+        }))
     }
 }

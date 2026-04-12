@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::read_bytes_at;
+use crate::snapshot::ReaderSnapshot;
+use serde::{Deserialize, Serialize};
 
 use super::compression::decompress;
 use super::ifd::{tag, Ifd, Photometric};
@@ -47,7 +49,7 @@ struct TiffFile {
 }
 
 /// A TIFF series groups IFDs that belong together (e.g., Z-stack stored as multiple IFDs).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TiffSeries {
     /// IFD indices belonging to this series.
     pub ifd_indices: Vec<usize>,
@@ -55,6 +57,7 @@ pub struct TiffSeries {
 }
 
 pub struct TiffReader {
+    path: Option<PathBuf>,
     file: Option<TiffFile>,
     series: Vec<TiffSeries>,
     current_series: usize,
@@ -63,15 +66,45 @@ pub struct TiffReader {
     ome_xml: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TiffReaderSnapshot {
+    pub path: PathBuf,
+    pub series: Vec<TiffSeries>,
+    pub current_series: usize,
+    pub current_resolution: usize,
+    pub ome_xml: Option<String>,
+    pub little_endian: bool,
+    pub ifds: Vec<Ifd>,
+}
+
 impl TiffReader {
     pub fn new() -> Self {
         TiffReader {
+            path: None,
             file: None,
             series: Vec::new(),
             current_series: 0,
             current_resolution: 0,
             ome_xml: None,
         }
+    }
+
+    pub fn from_snapshot(snapshot: TiffReaderSnapshot) -> Result<Self> {
+        let f = File::open(&snapshot.path).map_err(BioFormatsError::Io)?;
+        let buf = BufReader::new(f);
+        let mut parser = TiffParser::new(buf)?;
+        parser.little_endian = snapshot.little_endian;
+        Ok(Self {
+            path: Some(snapshot.path),
+            file: Some(TiffFile {
+                parser,
+                ifds: snapshot.ifds,
+            }),
+            series: snapshot.series,
+            current_series: snapshot.current_series,
+            current_resolution: snapshot.current_resolution,
+            ome_xml: snapshot.ome_xml,
+        })
     }
 
     /// Extract `IfdInfo` from a raw `Ifd`.
@@ -533,6 +566,7 @@ impl crate::common::reader::FormatReader for TiffReader {
                 t.starts_with("<?xml") || t.starts_with("<OME") || t.contains("<OME ")
             })
             .map(str::to_owned);
+        self.path = Some(path.to_path_buf());
         self.file = Some(tf);
         self.current_series = 0;
         self.current_resolution = 0;
@@ -540,6 +574,7 @@ impl crate::common::reader::FormatReader for TiffReader {
     }
 
     fn close(&mut self) -> Result<()> {
+        self.path = None;
         self.file = None;
         self.series.clear();
         self.ome_xml = None;
@@ -564,6 +599,10 @@ impl crate::common::reader::FormatReader for TiffReader {
 
     fn metadata(&self) -> &crate::common::metadata::ImageMetadata {
         &self.series[self.current_series].metadata
+    }
+
+    fn current_file(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -616,5 +655,18 @@ impl crate::common::reader::FormatReader for TiffReader {
         // Count sub-IFD levels if present; for now return series count
         // (real pyramid detection would use SubIFD tag chains)
         1
+    }
+
+    fn snapshot(&self) -> Result<ReaderSnapshot> {
+        let file = self.file.as_ref().ok_or(BioFormatsError::NotInitialized)?;
+        Ok(ReaderSnapshot::TiffReader(TiffReaderSnapshot {
+            path: self.path.clone().ok_or(BioFormatsError::NotInitialized)?,
+            series: self.series.clone(),
+            current_series: self.current_series,
+            current_resolution: self.current_resolution,
+            ome_xml: self.ome_xml.clone(),
+            little_endian: file.parser.little_endian,
+            ifds: file.ifds.clone(),
+        }))
     }
 }

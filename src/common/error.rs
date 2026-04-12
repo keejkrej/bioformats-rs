@@ -11,6 +11,8 @@ pub enum BioFormatsError {
     InvalidData(String),
     #[error("Codec error: {0}")]
     Codec(String),
+    #[error("Snapshot unsupported: {0}")]
+    SnapshotUnsupported(String),
     #[error("Reader not initialized — call set_id first")]
     NotInitialized,
     #[error("Series index {0} out of range")]

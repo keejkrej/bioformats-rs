@@ -4,6 +4,13 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::io::peek_header;
 use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
+use crate::snapshot::ReaderSnapshot;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImageReaderSnapshot {
+    pub current_path: PathBuf,
+    pub inner: Box<ReaderSnapshot>,
+}
 
 /// Auto-detecting image reader for the supported MVP formats.
 pub struct ImageReader {
@@ -37,6 +44,13 @@ impl ImageReader {
         let mut reader = Self::new();
         reader.set_id(path)?;
         Ok(reader)
+    }
+
+    pub fn from_snapshot(snapshot: ImageReaderSnapshot) -> Result<Self> {
+        Ok(Self {
+            inner: Some(snapshot.inner.into_reader()?),
+            current_path: Some(snapshot.current_path),
+        })
     }
 
     fn inner(&self) -> Result<&(dyn FormatReader + '_)> {
@@ -181,6 +195,10 @@ impl FormatReader for ImageReader {
             .metadata()
     }
 
+    fn current_file(&self) -> Option<&Path> {
+        self.current_path.as_deref()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner_mut()?.open_bytes(plane_index)
     }
@@ -214,5 +232,17 @@ impl FormatReader for ImageReader {
         self.inner()
             .expect("ImageReader not initialized")
             .resolution()
+    }
+
+    fn snapshot(&self) -> Result<ReaderSnapshot> {
+        let current_path = self
+            .current_path
+            .clone()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let inner = self.inner()?.snapshot()?;
+        Ok(ReaderSnapshot::ImageReader(ImageReaderSnapshot {
+            current_path,
+            inner: Box::new(inner),
+        }))
     }
 }

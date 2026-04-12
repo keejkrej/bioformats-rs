@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use crate::common::error::Result;
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{ImageMetadata, LookupTable};
+use crate::snapshot::ReaderSnapshot;
 
 /// Core trait implemented by each format reader.
 pub trait FormatReader: Send + Sync {
@@ -13,6 +14,12 @@ pub trait FormatReader: Send + Sync {
     fn set_series(&mut self, series: usize) -> Result<()>;
     fn series(&self) -> usize;
     fn metadata(&self) -> &ImageMetadata;
+    fn lookup_table(&self) -> Option<&LookupTable> {
+        self.metadata().lookup_table.as_ref()
+    }
+    fn current_file(&self) -> Option<&Path> {
+        None
+    }
     fn image_count(&self) -> u32 {
         self.metadata().image_count
     }
@@ -71,6 +78,14 @@ pub trait FormatReader: Send + Sync {
         h: u32,
     ) -> Result<Vec<u8>>;
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>>;
+    fn snapshot(&self) -> Result<ReaderSnapshot> {
+        Err(crate::common::error::BioFormatsError::SnapshotUnsupported(
+            std::any::type_name::<Self>().to_string(),
+        ))
+    }
+    fn clone_boxed(&self) -> Result<Box<dyn FormatReader>> {
+        self.snapshot()?.into_reader()
+    }
     fn resolution_count(&self) -> usize {
         1
     }

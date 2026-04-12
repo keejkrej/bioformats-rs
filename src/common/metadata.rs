@@ -1,8 +1,9 @@
 use super::pixel_type::PixelType;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Dimension ordering of the image planes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DimensionOrder {
     XYCTZ,
     XYCZT,
@@ -52,7 +53,7 @@ impl DimensionOrder {
 }
 
 /// A typed metadata value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MetadataValue {
     String(String),
     Int(i64),
@@ -74,7 +75,7 @@ impl std::fmt::Display for MetadataValue {
 }
 
 /// Optional indexed colour lookup table.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LookupTable {
     pub red: Vec<u16>,
     pub green: Vec<u16>,
@@ -82,7 +83,7 @@ pub struct LookupTable {
 }
 
 /// Core metadata for one image series.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMetadata {
     pub size_x: u32,
     pub size_y: u32,

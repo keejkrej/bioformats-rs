@@ -4,6 +4,13 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::reader::FormatReader;
 use crate::wrappers::reader_wrapper::ReaderWrapper;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelSeparatorSnapshot {
+    pub inner: Box<crate::snapshot::ReaderSnapshot>,
+    pub metadata: ImageMetadata,
+}
 
 /// Splits RGB planes into separate per-channel planes.
 pub struct ChannelSeparator {
@@ -50,6 +57,13 @@ impl ChannelSeparator {
         let (z, c, t) = self.metadata.get_zct_coords(no);
         let source_c = c / self.reader.rgb_channel_count();
         self.reader.get_index(z, source_c, t)
+    }
+
+    pub fn from_snapshot(snapshot: ChannelSeparatorSnapshot) -> Result<Self> {
+        Ok(Self {
+            reader: ReaderWrapper::with_box(snapshot.inner.into_reader()?),
+            metadata: snapshot.metadata,
+        })
     }
 }
 
@@ -146,5 +160,14 @@ impl FormatReader for ChannelSeparator {
 
     fn resolution(&self) -> usize {
         self.reader.resolution()
+    }
+
+    fn snapshot(&self) -> Result<crate::snapshot::ReaderSnapshot> {
+        Ok(crate::snapshot::ReaderSnapshot::ChannelSeparator(
+            ChannelSeparatorSnapshot {
+                inner: Box::new(self.reader.inner().snapshot()?),
+                metadata: self.metadata.clone(),
+            },
+        ))
     }
 }

@@ -4,6 +4,13 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
 use crate::wrappers::reader_wrapper::ReaderWrapper;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelMergerSnapshot {
+    pub inner: Box<crate::snapshot::ReaderSnapshot>,
+    pub metadata: ImageMetadata,
+}
 
 /// Merges non-RGB channel planes into a single multi-channel plane.
 pub struct ChannelMerger {
@@ -40,6 +47,13 @@ impl ChannelMerger {
 
     fn can_merge_from_metadata(source: &ImageMetadata) -> bool {
         source.size_c > 1 && source.size_c <= 4 && !source.is_rgb
+    }
+
+    pub fn from_snapshot(snapshot: ChannelMergerSnapshot) -> Result<Self> {
+        Ok(Self {
+            reader: ReaderWrapper::with_box(snapshot.inner.into_reader()?),
+            metadata: snapshot.metadata,
+        })
     }
 }
 
@@ -128,5 +142,14 @@ impl FormatReader for ChannelMerger {
 
     fn resolution(&self) -> usize {
         self.reader.resolution()
+    }
+
+    fn snapshot(&self) -> Result<crate::snapshot::ReaderSnapshot> {
+        Ok(crate::snapshot::ReaderSnapshot::ChannelMerger(
+            ChannelMergerSnapshot {
+                inner: Box::new(self.reader.inner().snapshot()?),
+                metadata: self.metadata.clone(),
+            },
+        ))
     }
 }

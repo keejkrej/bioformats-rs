@@ -17,6 +17,8 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::FormatReader;
+use crate::snapshot::ReaderSnapshot;
+use serde::{Deserialize, Serialize};
 
 // ---- pixel types (from DirectoryEntry) -------------------------------------
 
@@ -59,8 +61,8 @@ fn read_u64(data: &[u8], off: usize) -> u64 {
 
 // ---- DirectoryEntry (256 bytes) -------------------------------------------
 
-#[derive(Debug, Clone)]
-struct DirEntry {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntry {
     pixel_type: i32,
     file_position: i64,
     compression: i32,
@@ -268,6 +270,14 @@ pub struct CziReader {
     meta_xml: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CziReaderSnapshot {
+    pub path: PathBuf,
+    pub meta: ImageMetadata,
+    pub entries: Vec<DirEntry>,
+    pub meta_xml: String,
+}
+
 impl CziReader {
     pub fn new() -> Self {
         CziReader {
@@ -276,6 +286,15 @@ impl CziReader {
             entries: Vec::new(),
             meta_xml: String::new(),
         }
+    }
+
+    pub fn from_snapshot(snapshot: CziReaderSnapshot) -> Result<Self> {
+        Ok(Self {
+            path: Some(snapshot.path),
+            meta: Some(snapshot.meta),
+            entries: snapshot.entries,
+            meta_xml: snapshot.meta_xml,
+        })
     }
 
     fn find_entry(&self, plane_index: u32) -> Option<&DirEntry> {
@@ -391,6 +410,10 @@ impl FormatReader for CziReader {
         self.meta.as_ref().expect("set_id not called")
     }
 
+    fn current_file(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let meta = self.meta.as_ref().ok_or(BioFormatsError::NotInitialized)?;
         if plane_index >= meta.image_count {
@@ -471,6 +494,15 @@ impl FormatReader for CziReader {
         let (tw, th) = (meta.size_x.min(256), meta.size_y.min(256));
         let (tx, ty) = ((meta.size_x - tw) / 2, (meta.size_y - th) / 2);
         self.open_bytes_region(plane_index, tx, ty, tw, th)
+    }
+
+    fn snapshot(&self) -> Result<ReaderSnapshot> {
+        Ok(ReaderSnapshot::CziReader(CziReaderSnapshot {
+            path: self.path.clone().ok_or(BioFormatsError::NotInitialized)?,
+            meta: self.meta.clone().ok_or(BioFormatsError::NotInitialized)?,
+            entries: self.entries.clone(),
+            meta_xml: self.meta_xml.clone(),
+        }))
     }
 }
 

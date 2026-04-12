@@ -4,6 +4,15 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::reader::FormatReader;
 use crate::wrappers::reader_wrapper::ReaderWrapper;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DimensionSwapperSnapshot {
+    pub inner: Box<crate::snapshot::ReaderSnapshot>,
+    pub metadata: ImageMetadata,
+    pub input_order: DimensionOrder,
+    pub output_order: DimensionOrder,
+}
 
 /// Reinterprets source plane order and exposes a different output order.
 pub struct DimensionSwapper {
@@ -71,6 +80,15 @@ impl DimensionSwapper {
         let mut source_meta = self.metadata.clone();
         source_meta.dimension_order = self.input_order;
         source_meta.get_index(output_coords.0, output_coords.1, output_coords.2)
+    }
+
+    pub fn from_snapshot(snapshot: DimensionSwapperSnapshot) -> Result<Self> {
+        Ok(Self {
+            reader: ReaderWrapper::with_box(snapshot.inner.into_reader()?),
+            metadata: snapshot.metadata,
+            input_order: snapshot.input_order,
+            output_order: snapshot.output_order,
+        })
     }
 }
 
@@ -155,5 +173,16 @@ impl FormatReader for DimensionSwapper {
 
     fn resolution(&self) -> usize {
         self.reader.resolution()
+    }
+
+    fn snapshot(&self) -> Result<crate::snapshot::ReaderSnapshot> {
+        Ok(crate::snapshot::ReaderSnapshot::DimensionSwapper(
+            DimensionSwapperSnapshot {
+                inner: Box::new(self.reader.inner().snapshot()?),
+                metadata: self.metadata.clone(),
+                input_order: self.input_order,
+                output_order: self.output_order,
+            },
+        ))
     }
 }

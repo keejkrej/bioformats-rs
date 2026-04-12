@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 /// TIFF tag IDs — mirrors constants in Java `IFD.java`.
 #[allow(dead_code)]
 pub mod tag {
@@ -32,7 +34,7 @@ pub mod tag {
 }
 
 /// TIFF compression scheme codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compression {
     None,
     Ccitt,
@@ -64,7 +66,7 @@ impl From<u16> for Compression {
 }
 
 /// Photometric interpretation codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Photometric {
     MinIsWhite = 0,
     MinIsBlack = 1,
@@ -94,7 +96,7 @@ impl From<u16> for Photometric {
 }
 
 /// A TIFF tag value — can hold different numeric types or a byte array.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IfdValue {
     Byte(Vec<u8>),
     Ascii(String),
@@ -168,7 +170,7 @@ impl IfdValue {
 }
 
 /// One parsed IFD (Image File Directory).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Ifd {
     pub entries: std::collections::HashMap<u16, IfdValue>,
 }
