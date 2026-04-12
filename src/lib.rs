@@ -22,6 +22,7 @@ pub mod pixel;
 pub mod reader;
 pub mod registry;
 pub mod tiff;
+pub mod wrappers;
 
 pub use error::{BioFormatsError, Result};
 pub use metadata::{DimensionOrder, ImageMetadata, LookupTable, MetadataValue};
@@ -29,3 +30,4 @@ pub use pixel::PixelType;
 pub use reader::FormatReader;
 pub use registry::ImageReader;
 pub use tiff::TiffReader;
+pub use wrappers::{ChannelMerger, ChannelSeparator, DimensionSwapper, ReaderWrapper};

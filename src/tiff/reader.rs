@@ -235,6 +235,7 @@ impl TiffReader {
                     is_rgb,
                     is_interleaved: info.planar_config == 1,
                     is_indexed,
+                    is_false_color: true,
                     is_little_endian: little_endian,
                     resolution_count: 1,
                     series_metadata: HashMap::new(),

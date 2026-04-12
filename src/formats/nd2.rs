@@ -242,6 +242,7 @@ impl FormatReader for Nd2Reader {
             is_rgb: size_c == 3,
             is_interleaved: true,
             is_indexed: false,
+            is_false_color: true,
             is_little_endian: true,
             resolution_count: 1,
             series_metadata,

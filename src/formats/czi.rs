@@ -341,7 +341,11 @@ impl FormatReader for CziReader {
             size_x: parsed.width,
             size_y: parsed.height,
             size_z: parsed.z_count,
-            size_c: parsed.c_count,
+            size_c: if is_rgb {
+                parsed.c_count * parsed.spp
+            } else {
+                parsed.c_count
+            },
             size_t: parsed.t_count,
             pixel_type: parsed.pixel_type,
             bits_per_pixel: bps,
@@ -350,6 +354,7 @@ impl FormatReader for CziReader {
             is_rgb,
             is_interleaved: true,
             is_indexed: false,
+            is_false_color: true,
             is_little_endian: true,
             resolution_count: 1,
             series_metadata,
