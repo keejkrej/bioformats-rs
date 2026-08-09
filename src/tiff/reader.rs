@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, HashMap};
-use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +13,7 @@ use crate::common::metadata::{
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::{validate_region, FormatReader};
 use crate::snapshot::ReaderSnapshot;
+use crate::source::{CompanionReference, SourceCursor, SourceHandle, SourceInfo, SourceInput};
 
 use super::compression::{decompress, DecompressionOptions};
 use super::ifd::{tag, Compression, Ifd, IfdValue, Photometric};
@@ -128,7 +128,9 @@ fn try_byte_buffer(capacity: usize, zeroed: bool) -> Result<Vec<u8>> {
 #[derive(Debug)]
 struct TiffFileState {
     path: PathBuf,
-    parser: TiffParser<BufReader<File>>,
+    legacy_path: Option<PathBuf>,
+    source_info: SourceInfo,
+    parser: TiffParser<BufReader<SourceCursor>>,
     ifds: Vec<Ifd>,
     sub_ifds: Vec<Vec<Ifd>>,
 }
@@ -187,6 +189,7 @@ struct BaseTiffReader {
     minimal: MinimalTiffReader,
     series: Vec<SeriesData>,
     used_files: Vec<PathBuf>,
+    used_sources: Vec<SourceInfo>,
 }
 
 #[derive(Debug)]
@@ -194,6 +197,7 @@ struct OmeTiffReader {
     minimal: MinimalTiffReader,
     series: Vec<SeriesData>,
     used_files: Vec<PathBuf>,
+    used_sources: Vec<SourceInfo>,
     metadata_file: Option<PathBuf>,
 }
 
@@ -233,19 +237,45 @@ impl TiffReader {
     }
 
     pub fn from_snapshot(snapshot: TiffReaderSnapshot) -> Result<Self> {
-        let minimal = MinimalTiffReader::from_snapshot(snapshot.minimal)?;
-        let backend = match snapshot.kind {
+        let TiffReaderSnapshot {
+            kind,
+            minimal,
+            series,
+            used_files,
+            metadata_file,
+        } = snapshot;
+        let minimal = MinimalTiffReader::from_snapshot(minimal)?;
+        let pixel_sources = minimal
+            .files
+            .iter()
+            .map(|file| file.source_info.clone())
+            .collect::<Vec<_>>();
+        let backend = match kind {
             TiffBackendKind::Generic => TiffBackend::Generic(BaseTiffReader {
                 minimal,
-                series: snapshot.series,
-                used_files: snapshot.used_files,
+                series,
+                used_files,
+                used_sources: pixel_sources,
             }),
-            TiffBackendKind::Ome => TiffBackend::Ome(OmeTiffReader {
-                minimal,
-                series: snapshot.series,
-                used_files: snapshot.used_files,
-                metadata_file: snapshot.metadata_file,
-            }),
+            TiffBackendKind::Ome => {
+                let mut used_sources = pixel_sources;
+                if let Some(path) = metadata_file.as_ref() {
+                    let source = SourceInput::from_path(path)?.primary_handle()?;
+                    if !used_sources
+                        .iter()
+                        .any(|candidate| candidate.identity() == source.info().identity())
+                    {
+                        used_sources.insert(0, source.info().clone());
+                    }
+                }
+                TiffBackend::Ome(OmeTiffReader {
+                    minimal,
+                    series,
+                    used_files,
+                    used_sources,
+                    metadata_file,
+                })
+            }
         };
         Ok(Self {
             backend: Some(backend),
@@ -288,6 +318,13 @@ impl TiffReader {
         })
     }
 
+    fn used_sources_ref(&self) -> Result<&[SourceInfo]> {
+        Ok(match self.backend()? {
+            TiffBackend::Generic(reader) => &reader.used_sources,
+            TiffBackend::Ome(reader) => &reader.used_sources,
+        })
+    }
+
     fn active_metadata(&self) -> Result<&ImageMetadata> {
         let minimal = self.minimal()?;
         let series = self.series_list()?;
@@ -302,9 +339,20 @@ impl TiffReader {
         Ok(&series[root].resolutions[resolution].planes)
     }
 
-    fn generic_from_minimal(path: &Path, minimal: MinimalTiffReader) -> Result<BaseTiffReader> {
+    fn generic_from_minimal(minimal: MinimalTiffReader) -> Result<BaseTiffReader> {
+        let used_files = minimal
+            .files
+            .iter()
+            .filter_map(|file| file.legacy_path.clone())
+            .collect::<Vec<_>>();
+        let used_sources = minimal
+            .files
+            .iter()
+            .map(|file| file.source_info.clone())
+            .collect::<Vec<_>>();
         let mut reader = BaseTiffReader {
-            used_files: vec![path.to_path_buf()],
+            used_files,
+            used_sources,
             series: Vec::new(),
             minimal,
         };
@@ -312,59 +360,136 @@ impl TiffReader {
         Ok(reader)
     }
 
-    fn ome_from_path(path: &Path) -> Result<OmeTiffReader> {
-        let lower = path.to_string_lossy().to_ascii_lowercase();
-        let (xml, metadata_file, default_file) = if lower.ends_with(".companion.ome")
+    fn ome_from_input(input: SourceInput) -> Result<OmeTiffReader> {
+        let primary = input.primary_handle()?;
+        let lower = primary.info().name().to_ascii_lowercase();
+        let (xml, metadata_source, default_source) = if lower.ends_with(".companion.ome")
             || lower.ends_with(".ome")
         {
             (
-                std::fs::read_to_string(path)?,
-                Some(path.to_path_buf()),
+                source_text(&primary, "OME metadata")?,
+                Some(primary.clone()),
                 None,
             )
         } else {
-            let minimal = MinimalTiffReader::from_paths(&[path.to_path_buf()])?;
+            let minimal = MinimalTiffReader::from_sources(vec![primary.clone()])?;
             let xml = minimal
                 .files
                 .first()
                 .and_then(first_ome_xml)
                 .ok_or_else(|| BioFormatsError::Format("TIFF does not contain OME-XML".into()))?;
             if let Some(companion) = binary_only_metadata_file(&xml)? {
-                let companion_path = path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(companion);
+                let companion_source =
+                    required_companion(&input, &primary, CompanionReference::Named(&companion))?;
                 (
-                    std::fs::read_to_string(&companion_path)?,
-                    Some(companion_path),
-                    Some(path.to_path_buf()),
+                    source_text(&companion_source, "OME companion metadata")?,
+                    Some(companion_source),
+                    Some(primary.clone()),
                 )
             } else {
-                (xml, None, Some(path.to_path_buf()))
+                (xml, None, Some(primary.clone()))
             }
         };
 
-        let metadata_base = metadata_file
+        let reference_source = metadata_source
             .as_ref()
-            .map(|value| value.parent().unwrap_or_else(|| Path::new(".")))
-            .or_else(|| default_file.as_ref().and_then(|value| value.parent()))
-            .unwrap_or_else(|| Path::new("."));
-        let parsed = parse_ome_dataset(&xml, metadata_base, default_file.as_deref())?;
-        let minimal = MinimalTiffReader::from_paths(&parsed.used_files)?;
-        let used_files = if let Some(metadata_file) = metadata_file.as_ref() {
-            let mut files = vec![metadata_file.clone()];
-            files.extend(parsed.used_files.iter().cloned());
-            files
-        } else {
-            parsed.used_files.clone()
-        };
+            .or(default_source.as_ref())
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let reference_name = Path::new(reference_source.info().name());
+        let metadata_base = reference_name.parent().unwrap_or_else(|| Path::new(""));
+        let default_file = default_source
+            .as_ref()
+            .map(|source| Path::new(source.info().name()));
+        let parsed = parse_ome_dataset(&xml, metadata_base, default_file)?;
+
+        let mut named_sources = Vec::new();
+        for logical_path in &parsed.used_files {
+            let source = default_source
+                .as_ref()
+                .filter(|source| Path::new(source.info().name()) == logical_path)
+                .cloned()
+                .or_else(|| {
+                    (Path::new(primary.info().name()) == logical_path).then(|| primary.clone())
+                });
+            let source = match source {
+                Some(source) => source,
+                None => {
+                    let reference = logical_path
+                        .strip_prefix(metadata_base)
+                        .unwrap_or(logical_path)
+                        .to_string_lossy();
+                    required_companion(
+                        &input,
+                        reference_source,
+                        CompanionReference::Named(&reference),
+                    )?
+                }
+            };
+            named_sources.push((logical_path.clone(), source));
+        }
+        let minimal = MinimalTiffReader::from_named_sources(named_sources)?;
+
+        let mut used_files = Vec::new();
+        let mut used_sources = Vec::new();
+        if let Some(metadata_source) = metadata_source.as_ref() {
+            push_source_once(&mut used_sources, metadata_source.info());
+            if let Some(path) = metadata_source.path() {
+                used_files.push(path.to_path_buf());
+            }
+        }
+        for file in &minimal.files {
+            push_source_once(&mut used_sources, &file.source_info);
+            if let Some(path) = file.legacy_path.as_ref() {
+                if !used_files.contains(path) {
+                    used_files.push(path.clone());
+                }
+            }
+        }
+        let metadata_file = metadata_source.and_then(|source| source.path().map(Path::to_path_buf));
 
         Ok(OmeTiffReader {
             series: build_ome_series(&minimal, &parsed, &used_files)?,
             minimal,
             used_files,
+            used_sources,
             metadata_file,
         })
+    }
+}
+
+fn source_text(source: &SourceHandle, context: &str) -> Result<String> {
+    String::from_utf8(source.read_all(context)?).map_err(|error| {
+        BioFormatsError::Format(format!(
+            "{context} source {} is not UTF-8: {error}",
+            source.info().identity()
+        ))
+    })
+}
+
+fn required_companion(
+    input: &SourceInput,
+    from: &SourceHandle,
+    reference: CompanionReference<'_>,
+) -> Result<SourceHandle> {
+    input
+        .resolve(from, reference)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| BioFormatsError::CompanionNotFound {
+            identity: from.info().identity().clone(),
+            reference: match reference {
+                CompanionReference::Named(name) => name.to_owned(),
+                CompanionReference::Siblings => "<siblings>".to_owned(),
+            },
+        })
+}
+
+fn push_source_once(sources: &mut Vec<SourceInfo>, source: &SourceInfo) {
+    if !sources
+        .iter()
+        .any(|existing| existing.identity() == source.identity())
+    {
+        sources.push(source.clone());
     }
 }
 
@@ -399,19 +524,21 @@ impl FormatReader for TiffReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let lower = path.to_string_lossy().to_ascii_lowercase();
+        self.set_source(SourceInput::from_path(path)?)
+    }
+
+    fn set_source(&mut self, input: SourceInput) -> Result<()> {
+        let primary = input.primary_handle()?;
+        let lower = primary.info().name().to_ascii_lowercase();
         if lower.ends_with(".companion.ome") || lower.ends_with(".ome") {
-            self.backend = Some(TiffBackend::Ome(Self::ome_from_path(path)?));
+            self.backend = Some(TiffBackend::Ome(Self::ome_from_input(input)?));
             return Ok(());
         }
-
-        let minimal = MinimalTiffReader::from_paths(&[path.to_path_buf()])?;
+        let minimal = MinimalTiffReader::from_sources(vec![primary])?;
         if minimal.files.first().and_then(first_ome_xml).is_some() {
-            self.backend = Some(TiffBackend::Ome(Self::ome_from_path(path)?));
+            self.backend = Some(TiffBackend::Ome(Self::ome_from_input(input)?));
         } else {
-            self.backend = Some(TiffBackend::Generic(Self::generic_from_minimal(
-                path, minimal,
-            )?));
+            self.backend = Some(TiffBackend::Generic(Self::generic_from_minimal(minimal)?));
         }
         Ok(())
     }
@@ -451,6 +578,12 @@ impl FormatReader for TiffReader {
     fn used_files(&self) -> Vec<PathBuf> {
         self.used_files_ref()
             .map(|files| files.to_vec())
+            .unwrap_or_default()
+    }
+
+    fn used_sources(&self) -> Vec<SourceInfo> {
+        self.used_sources_ref()
+            .map(<[SourceInfo]>::to_vec)
             .unwrap_or_default()
     }
 
@@ -504,14 +637,14 @@ impl FormatReader for TiffReader {
         let snapshot = match backend {
             TiffBackend::Generic(reader) => TiffReaderSnapshot {
                 kind: TiffBackendKind::Generic,
-                minimal: reader.minimal.snapshot(),
+                minimal: reader.minimal.snapshot()?,
                 series: reader.series.clone(),
                 used_files: reader.used_files.clone(),
                 metadata_file: None,
             },
             TiffBackend::Ome(reader) => TiffReaderSnapshot {
                 kind: TiffBackendKind::Ome,
-                minimal: reader.minimal.snapshot(),
+                minimal: reader.minimal.snapshot()?,
                 series: reader.series.clone(),
                 used_files: reader.used_files.clone(),
                 metadata_file: reader.metadata_file.clone(),
@@ -566,20 +699,32 @@ impl MinimalTiffReader {
         })
     }
 
-    fn snapshot(&self) -> MinimalTiffReaderSnapshot {
-        MinimalTiffReaderSnapshot {
-            files: self.files.iter().map(TiffFileState::snapshot).collect(),
+    fn snapshot(&self) -> Result<MinimalTiffReaderSnapshot> {
+        Ok(MinimalTiffReaderSnapshot {
+            files: self
+                .files
+                .iter()
+                .map(TiffFileState::snapshot)
+                .collect::<Result<Vec<_>>>()?,
             current_root_series: self.current_root_series,
             current_resolution: self.current_resolution,
             flattened_resolutions: self.flattened_resolutions,
-        }
+        })
     }
 
-    fn from_paths(paths: &[PathBuf]) -> Result<Self> {
-        let mut files = Vec::with_capacity(paths.len());
-        for path in paths {
-            files.push(TiffFileState::open(path)?);
-        }
+    fn from_sources(sources: Vec<SourceHandle>) -> Result<Self> {
+        let named = sources
+            .into_iter()
+            .map(|source| (PathBuf::from(source.info().name()), source))
+            .collect();
+        Self::from_named_sources(named)
+    }
+
+    fn from_named_sources(sources: Vec<(PathBuf, SourceHandle)>) -> Result<Self> {
+        let files = sources
+            .into_iter()
+            .map(|(logical_path, source)| TiffFileState::open_as(source, logical_path))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             files,
             current_root_series: 0,
@@ -701,9 +846,21 @@ impl MinimalTiffReader {
 }
 
 impl TiffFileState {
-    fn open(path: &Path) -> Result<Self> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
+    #[cfg(test)]
+    fn open_path(path: &Path) -> Result<Self> {
+        Self::open(SourceInput::from_path(path)?.primary_handle()?)
+    }
+
+    #[cfg(test)]
+    fn open(source: SourceHandle) -> Result<Self> {
+        let path = PathBuf::from(source.info().name());
+        Self::open_as(source, path)
+    }
+
+    fn open_as(source: SourceHandle, path: PathBuf) -> Result<Self> {
+        let legacy_path = source.path().map(Path::to_path_buf);
+        let source_info = source.info().clone();
+        let reader = BufReader::new(source.cursor());
         let mut parser = TiffParser::new(reader)?;
         let ifds = parser.read_ifds()?;
         let sub_ifds = ifds
@@ -717,29 +874,39 @@ impl TiffFileState {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            path: path.to_path_buf(),
+            path,
+            legacy_path,
+            source_info,
             parser,
             ifds,
             sub_ifds,
         })
     }
 
-    fn snapshot(&self) -> TiffFileSnapshot {
-        TiffFileSnapshot {
-            path: self.path.clone(),
+    fn snapshot(&self) -> Result<TiffFileSnapshot> {
+        let path = self.legacy_path.clone().ok_or_else(|| {
+            BioFormatsError::SnapshotUnsupported(
+                "TIFF reader initialized from application-provided sources".into(),
+            )
+        })?;
+        Ok(TiffFileSnapshot {
+            path,
             little_endian: self.parser.little_endian,
             ifds: self.ifds.clone(),
             sub_ifds: self.sub_ifds.clone(),
-        }
+        })
     }
 
     fn from_snapshot(snapshot: TiffFileSnapshot) -> Result<Self> {
-        let file = File::open(&snapshot.path)?;
-        let reader = BufReader::new(file);
+        let source = SourceInput::from_path(&snapshot.path)?.primary_handle()?;
+        let source_info = source.info().clone();
+        let reader = BufReader::new(source.cursor());
         let mut parser = TiffParser::new(reader)?;
         parser.little_endian = snapshot.little_endian;
         Ok(Self {
-            path: snapshot.path,
+            path: snapshot.path.clone(),
+            legacy_path: Some(snapshot.path),
+            source_info,
             parser,
             ifds: snapshot.ifds,
             sub_ifds: snapshot.sub_ifds,
@@ -2933,7 +3100,7 @@ mod tests {
     #[test]
     fn rejects_plane_byte_count_overflow_before_allocating() {
         let fixture = TempTiff::write("overflow", &planar_stripped_tiff());
-        let mut state = TiffFileState::open(&fixture.path).unwrap();
+        let mut state = TiffFileState::open_path(&fixture.path).unwrap();
         let ifd = &mut state.ifds[0];
         ifd.entries
             .insert(tag::IMAGE_WIDTH, IfdValue::Long(vec![u32::MAX]));
@@ -2967,7 +3134,7 @@ mod tests {
     #[test]
     fn rejects_structural_tiff_values_that_do_not_fit_target_types() {
         let fixture = TempTiff::write("structural_overflow", &planar_stripped_tiff());
-        let mut state = TiffFileState::open(&fixture.path).unwrap();
+        let mut state = TiffFileState::open_path(&fixture.path).unwrap();
         let ifd = &mut state.ifds[0];
 
         ifd.entries.insert(
@@ -3026,7 +3193,7 @@ mod tests {
     fn rejects_short_or_oversized_uncompressed_tile_storage() {
         let fixture = TempTiff::write("raw_tile_bounds", &planar_tiled_tiff());
 
-        let mut short = TiffFileState::open(&fixture.path).unwrap();
+        let mut short = TiffFileState::open_path(&fixture.path).unwrap();
         short.ifds[0].entries.insert(
             tag::TILE_BYTE_COUNTS,
             IfdValue::Long(vec![1, 2, 2, 2, 2, 2, 2, 2]),
@@ -3046,7 +3213,7 @@ mod tests {
             Err(BioFormatsError::InvalidData(message)) if message.contains("at least 2 bytes")
         ));
 
-        let mut oversized = TiffFileState::open(&fixture.path).unwrap();
+        let mut oversized = TiffFileState::open_path(&fixture.path).unwrap();
         oversized.ifds[0].entries.insert(
             tag::TILE_BYTE_COUNTS,
             IfdValue::Long(vec![u32::MAX, 2, 2, 2, 2, 2, 2, 2]),

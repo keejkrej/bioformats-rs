@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{ImageMetadata, LookupTable};
 use crate::snapshot::ReaderSnapshot;
+use crate::source::{SourceInfo, SourceInput};
 
 /// Validate a requested rectangle before a format reader performs offset math.
 pub(crate) fn validate_region(
@@ -71,6 +72,20 @@ pub trait FormatReader: Send + Sync {
     fn is_this_type_by_name(&self, path: &Path) -> bool;
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool;
     fn set_id(&mut self, path: &Path) -> Result<()>;
+    /// Initialize from an application-provided random-access source.
+    ///
+    /// Built-in readers override this. The default keeps existing third-party
+    /// path-only readers source-compatible and accepts only filesystem input.
+    fn set_source(&mut self, input: SourceInput) -> Result<()> {
+        if let Some(path) = input.primary_path() {
+            self.set_id(path)
+        } else {
+            Err(BioFormatsError::UnsupportedFormat(format!(
+                "{} does not support application-provided sources",
+                std::any::type_name::<Self>()
+            )))
+        }
+    }
     fn close(&mut self) -> Result<()>;
     fn series_count(&self) -> usize;
     fn set_series(&mut self, series: usize) -> Result<()>;
@@ -86,6 +101,10 @@ pub trait FormatReader: Send + Sync {
         self.current_file()
             .map(|path| vec![path.to_path_buf()])
             .unwrap_or_default()
+    }
+    /// Stable identities of every source used by the opened dataset.
+    fn used_sources(&self) -> Vec<SourceInfo> {
+        Vec::new()
     }
     fn image_count(&self) -> u32 {
         self.metadata().image_count

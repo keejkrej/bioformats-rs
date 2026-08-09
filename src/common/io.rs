@@ -35,7 +35,7 @@ pub fn read_cstring(data: &[u8]) -> String {
 /// Peek at the first N bytes of a file without consuming a reader.
 pub fn peek_header(path: &std::path::Path, n: usize) -> Result<Vec<u8>> {
     use std::fs::File;
-    let mut f = File::open(path).map_err(BioFormatsError::Io)?;
+    let mut f = File::open(path).map_err(BioFormatsError::from)?;
     if n > isize::MAX as usize {
         return Err(BioFormatsError::PlaneByteCountOverflow);
     }
@@ -44,7 +44,7 @@ pub fn peek_header(path: &std::path::Path, n: usize) -> Result<Vec<u8>> {
         BioFormatsError::InvalidData(format!("cannot allocate {n}-byte header buffer: {error}"))
     })?;
     buf.resize(n, 0);
-    let read = f.read(&mut buf).map_err(BioFormatsError::Io)?;
+    let read = f.read(&mut buf).map_err(BioFormatsError::from)?;
     buf.truncate(read);
     Ok(buf)
 }

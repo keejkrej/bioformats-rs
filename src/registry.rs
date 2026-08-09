@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::io::peek_header;
 use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
 use crate::snapshot::ReaderSnapshot;
+use crate::source::{normalize_source_error, SourceInfo, SourceInput};
 
 /// Stable identifier for a built-in reader family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -72,6 +72,7 @@ pub struct ImageReaderSnapshot {
 pub struct ImageReader {
     inner: Option<Box<dyn FormatReader>>,
     current_path: Option<PathBuf>,
+    current_source: Option<SourceInfo>,
     format: Option<FormatId>,
 }
 
@@ -131,6 +132,7 @@ impl ImageReader {
         Self {
             inner: None,
             current_path: None,
+            current_source: None,
             format: None,
         }
     }
@@ -141,11 +143,18 @@ impl ImageReader {
         Ok(reader)
     }
 
+    pub fn open_source(input: SourceInput) -> Result<Self> {
+        let mut reader = Self::new();
+        FormatReader::set_source(&mut reader, input)?;
+        Ok(reader)
+    }
+
     pub fn from_snapshot(snapshot: ImageReaderSnapshot) -> Result<Self> {
         let format = snapshot_format(&snapshot.inner).ok_or(BioFormatsError::NotInitialized)?;
         Ok(Self {
             inner: Some(snapshot.inner.into_reader()?),
             current_path: Some(snapshot.current_path),
+            current_source: None,
             format: Some(format),
         })
     }
@@ -175,11 +184,15 @@ impl ImageReader {
     }
 
     pub fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner_mut()?.open_bytes(plane_index)
+        self.inner_mut()?
+            .open_bytes(plane_index)
+            .map_err(normalize_source_error)
     }
 
     pub fn open_bytes_into(&mut self, plane_index: u32, destination: &mut [u8]) -> Result<usize> {
-        self.inner_mut()?.open_bytes_into(plane_index, destination)
+        self.inner_mut()?
+            .open_bytes_into(plane_index, destination)
+            .map_err(normalize_source_error)
     }
 
     pub fn open_bytes_region(
@@ -190,7 +203,9 @@ impl ImageReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        self.inner_mut()?.open_bytes_region(plane_index, x, y, w, h)
+        self.inner_mut()?
+            .open_bytes_region(plane_index, x, y, w, h)
+            .map_err(normalize_source_error)
     }
 
     pub fn open_bytes_region_into(
@@ -204,10 +219,13 @@ impl ImageReader {
     ) -> Result<usize> {
         self.inner_mut()?
             .open_bytes_region_into(plane_index, x, y, w, h, destination)
+            .map_err(normalize_source_error)
     }
 
     pub fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner_mut()?.open_thumb_bytes(plane_index)
+        self.inner_mut()?
+            .open_thumb_bytes(plane_index)
+            .map_err(normalize_source_error)
     }
 
     pub fn series_count(&self) -> usize {
@@ -228,6 +246,18 @@ impl ImageReader {
         self.inner()
             .expect("ImageReader not initialized")
             .used_files()
+    }
+
+    pub fn used_sources(&self) -> Vec<SourceInfo> {
+        let sources = self
+            .inner()
+            .expect("ImageReader not initialized")
+            .used_sources();
+        if sources.is_empty() {
+            self.current_source.iter().cloned().collect()
+        } else {
+            sources
+        }
     }
 
     pub fn resolution_count(&self) -> usize {
@@ -262,6 +292,7 @@ impl ImageReader {
         }
         self.inner = None;
         self.current_path = None;
+        self.current_source = None;
         self.format = None;
         Ok(())
     }
@@ -281,30 +312,42 @@ impl FormatReader for ImageReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let header = peek_header(path, 4096)?;
+        FormatReader::set_source(self, SourceInput::from_path(path)?)
+    }
+
+    fn set_source(&mut self, input: SourceInput) -> Result<()> {
+        let primary = input.primary_handle()?;
+        let header = primary.read_prefix(4096)?;
+        let logical_path = Path::new(primary.info().name());
 
         for (format, mut reader) in all_readers() {
             if reader.is_this_type_by_bytes(&header) {
-                reader.set_id(path)?;
+                reader
+                    .set_source(input.clone())
+                    .map_err(normalize_source_error)?;
                 self.inner = Some(reader);
-                self.current_path = Some(path.to_path_buf());
+                self.current_path = input.primary_path().map(Path::to_path_buf);
+                self.current_source = Some(primary.info().clone());
                 self.format = Some(format);
                 return Ok(());
             }
         }
 
         for (format, mut reader) in all_readers() {
-            if reader.is_this_type_by_name(path) {
-                reader.set_id(path)?;
+            if reader.is_this_type_by_name(logical_path) {
+                reader
+                    .set_source(input.clone())
+                    .map_err(normalize_source_error)?;
                 self.inner = Some(reader);
-                self.current_path = Some(path.to_path_buf());
+                self.current_path = input.primary_path().map(Path::to_path_buf);
+                self.current_source = Some(primary.info().clone());
                 self.format = Some(format);
                 return Ok(());
             }
         }
 
         Err(BioFormatsError::UnsupportedFormat(
-            path.display().to_string(),
+            primary.info().name().to_owned(),
         ))
     }
 
@@ -342,12 +385,16 @@ impl FormatReader for ImageReader {
             .unwrap_or_default()
     }
 
+    fn used_sources(&self) -> Vec<SourceInfo> {
+        ImageReader::used_sources(self)
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner_mut()?.open_bytes(plane_index)
+        ImageReader::open_bytes(self, plane_index)
     }
 
     fn open_bytes_into(&mut self, plane_index: u32, destination: &mut [u8]) -> Result<usize> {
-        self.inner_mut()?.open_bytes_into(plane_index, destination)
+        ImageReader::open_bytes_into(self, plane_index, destination)
     }
 
     fn open_bytes_region(
@@ -358,7 +405,7 @@ impl FormatReader for ImageReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
-        self.inner_mut()?.open_bytes_region(plane_index, x, y, w, h)
+        ImageReader::open_bytes_region(self, plane_index, x, y, w, h)
     }
 
     fn open_bytes_region_into(
@@ -370,12 +417,11 @@ impl FormatReader for ImageReader {
         h: u32,
         destination: &mut [u8],
     ) -> Result<usize> {
-        self.inner_mut()?
-            .open_bytes_region_into(plane_index, x, y, w, h, destination)
+        ImageReader::open_bytes_region_into(self, plane_index, x, y, w, h, destination)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
-        self.inner_mut()?.open_thumb_bytes(plane_index)
+        ImageReader::open_thumb_bytes(self, plane_index)
     }
 
     fn resolution_count(&self) -> usize {
@@ -405,10 +451,15 @@ impl FormatReader for ImageReader {
     }
 
     fn snapshot(&self) -> Result<ReaderSnapshot> {
-        let current_path = self
-            .current_path
-            .clone()
-            .ok_or(BioFormatsError::NotInitialized)?;
+        let current_path = self.current_path.clone().ok_or_else(|| {
+            if self.current_source.is_some() {
+                BioFormatsError::SnapshotUnsupported(
+                    "application-provided sources require explicit rebinding".into(),
+                )
+            } else {
+                BioFormatsError::NotInitialized
+            }
+        })?;
         let inner = self.inner()?.snapshot()?;
         Ok(ReaderSnapshot::ImageReader(ImageReaderSnapshot {
             current_path,

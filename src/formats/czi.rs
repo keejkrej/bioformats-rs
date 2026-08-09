@@ -9,10 +9,14 @@
 //! Supported compressions: Uncompressed, JPEG (new-style), LZW, Zstd.
 //! JPEG-XR is detected but not decoded.
 
-use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File};
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::fs::{self, File};
+#[cfg(test)]
+use std::io::BufReader;
 
 use crate::common::codec::{decompress_lzw_limited, decompress_zstd_limited};
 use crate::common::error::{BioFormatsError, Result};
@@ -22,6 +26,7 @@ use crate::common::metadata::{
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::{validate_region, FormatReader};
 use crate::snapshot::ReaderSnapshot;
+use crate::source::{SourceHandle, SourceInfo, SourceInput};
 use roxmltree::{Document, Node};
 use serde::{Deserialize, Serialize};
 
@@ -244,8 +249,7 @@ struct CziParsedFile {
     entries: Vec<DirEntry>,
 }
 
-fn parse_czi_file(f: &mut BufReader<File>) -> std::io::Result<CziParsedFile> {
-    let file_len = f.get_ref().metadata()?.len();
+fn parse_czi_file<R: Read + Seek>(f: &mut R, file_len: u64) -> std::io::Result<CziParsedFile> {
     let mut hdr = vec![0u8; SEG_HEADER];
     f.read_exact(&mut hdr)?;
     let seg_type = read_seg_type(&hdr);
@@ -692,6 +696,7 @@ fn czi_part_index(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn discover_czi_files(path: &Path) -> Vec<PathBuf> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let Some(base) = file_stem_without_part(path) else {
@@ -736,6 +741,23 @@ fn discover_czi_files(path: &Path) -> Vec<PathBuf> {
             .then_with(|| left.cmp(right))
     });
     files
+}
+
+fn is_czi_member_named(name: &str, base: &str) -> bool {
+    let path = Path::new(name);
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("czi"))
+        && file_stem_without_part(path).is_some_and(|candidate_base| candidate_base == base)
+}
+
+fn is_czi_master_named(name: &str, base: &str) -> bool {
+    let path = Path::new(name);
+    is_czi_member_named(name, base)
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem == base)
 }
 
 fn dim_start(entry: &DirEntry, key: &str) -> i32 {
@@ -1013,6 +1035,7 @@ fn build_czi_series(
 pub struct CziReader {
     path: Option<PathBuf>,
     used_files: Vec<PathBuf>,
+    sources: Vec<SourceHandle>,
     entries: Vec<CziLocatedEntry>,
     meta_xml: String,
     series: Vec<CziSeries>,
@@ -1034,6 +1057,7 @@ impl CziReader {
         Self {
             path: None,
             used_files: Vec::new(),
+            sources: Vec::new(),
             entries: Vec::new(),
             meta_xml: String::new(),
             series: Vec::new(),
@@ -1042,9 +1066,15 @@ impl CziReader {
     }
 
     pub fn from_snapshot(snapshot: CziReaderSnapshot) -> Result<Self> {
+        let sources = snapshot
+            .used_files
+            .iter()
+            .map(|path| SourceInput::from_path(path)?.primary_handle())
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             path: Some(snapshot.path),
             used_files: snapshot.used_files,
+            sources,
             entries: snapshot.entries,
             meta_xml: snapshot.meta_xml,
             series: snapshot.series,
@@ -1063,30 +1093,34 @@ impl CziReader {
             .entries
             .get(plane.entry_index)
             .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane.entry_index as u32))?;
-        let path = self
-            .used_files
+        let source = self
+            .sources
             .get(located.file_index)
             .ok_or(BioFormatsError::NotInitialized)?;
-        let mut file = File::open(path).map_err(BioFormatsError::Io)?;
+        let file_len = source.info().len();
+        let mut reader = source.cursor();
 
         let segment_position = u64::try_from(located.entry.file_position)
             .map_err(|_| BioFormatsError::InvalidData("negative CZI subblock position".into()))?;
-        file.seek(SeekFrom::Start(segment_position))
-            .map_err(BioFormatsError::Io)?;
+        reader
+            .seek(SeekFrom::Start(segment_position))
+            .map_err(BioFormatsError::from)?;
         let mut seg_hdr = vec![0u8; SEG_HEADER];
-        file.read_exact(&mut seg_hdr).map_err(BioFormatsError::Io)?;
+        reader
+            .read_exact(&mut seg_hdr)
+            .map_err(BioFormatsError::from)?;
         if !read_seg_type(&seg_hdr).starts_with("ZISRAWSUBBLOCK") {
             return Err(BioFormatsError::InvalidData(
                 "CZI directory entry does not reference a subblock".into(),
             ));
         }
-        let used_size = segment_used_size(&seg_hdr).map_err(BioFormatsError::Io)?;
-        let file_len = file.metadata().map_err(BioFormatsError::Io)?.len();
+        let used_size = segment_used_size(&seg_hdr).map_err(BioFormatsError::from)?;
         validate_segment_range(segment_position, used_size, file_len, "subblock")
-            .map_err(BioFormatsError::Io)?;
+            .map_err(BioFormatsError::from)?;
         let mut subblock_hdr = vec![0u8; 16];
-        file.read_exact(&mut subblock_hdr)
-            .map_err(BioFormatsError::Io)?;
+        reader
+            .read_exact(&mut subblock_hdr)
+            .map_err(BioFormatsError::from)?;
         let metadata_size = u64::try_from(read_i32(&subblock_hdr, 0)).map_err(|_| {
             BioFormatsError::InvalidData("negative CZI subblock metadata size".into())
         })?;
@@ -1136,8 +1170,9 @@ impl CziReader {
             )));
         }
 
-        file.seek(SeekFrom::Start(data_position))
-            .map_err(BioFormatsError::Io)?;
+        reader
+            .seek(SeekFrom::Start(data_position))
+            .map_err(BioFormatsError::from)?;
 
         let mut compressed = Vec::new();
         compressed.try_reserve_exact(data_size).map_err(|_| {
@@ -1146,8 +1181,9 @@ impl CziReader {
             ))
         })?;
         compressed.resize(data_size, 0);
-        file.read_exact(&mut compressed)
-            .map_err(BioFormatsError::Io)?;
+        reader
+            .read_exact(&mut compressed)
+            .map_err(BioFormatsError::from)?;
         let mut raw = decompress_subblock(&compressed, located.entry.compression, expected)?;
         if raw.len() < expected {
             return Err(BioFormatsError::InvalidData(format!(
@@ -1186,14 +1222,58 @@ impl FormatReader for CziReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let used_files = discover_czi_files(path);
+        self.set_source(SourceInput::from_path(path)?)
+    }
+
+    fn set_source(&mut self, input: SourceInput) -> Result<()> {
+        let primary = input.primary_handle()?;
+        let primary_identity = primary.info().identity().clone();
+        let base = file_stem_without_part(Path::new(primary.info().name()));
+        let mut sources = vec![primary.clone()];
+        if let Some(base) = base.as_deref() {
+            sources.extend(
+                input.resolve_siblings_where(&primary, |name| is_czi_member_named(name, base))?,
+            );
+        }
+
+        let mut identities = HashSet::new();
+        sources.retain(|source| identities.insert(source.info().identity().clone()));
+        if let Some(base) = base.as_deref() {
+            sources.retain(|source| {
+                source.info().identity() == &primary_identity
+                    || is_czi_member_named(source.info().name(), base)
+            });
+
+            let first_identity = sources
+                .iter()
+                .find(|source| is_czi_master_named(source.info().name(), base))
+                .map(|source| source.info().identity().clone())
+                .unwrap_or_else(|| primary_identity.clone());
+            sources.sort_by(|left, right| {
+                let left_first = left.info().identity() == &first_identity;
+                let right_first = right.info().identity() == &first_identity;
+                right_first
+                    .cmp(&left_first)
+                    .then_with(|| {
+                        czi_part_index(Path::new(left.info().name()))
+                            .cmp(&czi_part_index(Path::new(right.info().name())))
+                    })
+                    .then_with(|| left.info().name().cmp(right.info().name()))
+                    .then_with(|| left.info().identity().cmp(right.info().identity()))
+            });
+        }
+
+        let used_files = sources
+            .iter()
+            .filter_map(|source| source.path().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
         let mut entries = Vec::new();
         let mut meta_xml = String::new();
 
-        for (file_index, file_path) in used_files.iter().enumerate() {
-            let file = File::open(file_path).map_err(BioFormatsError::Io)?;
-            let mut reader = BufReader::new(file);
-            let parsed = parse_czi_file(&mut reader).map_err(BioFormatsError::Io)?;
+        for (file_index, source) in sources.iter().enumerate() {
+            let mut reader = source.cursor();
+            let parsed =
+                parse_czi_file(&mut reader, source.info().len()).map_err(BioFormatsError::from)?;
             if meta_xml.is_empty() && !parsed.meta_xml.trim().is_empty() {
                 meta_xml = parsed.meta_xml.clone();
             }
@@ -1206,8 +1286,12 @@ impl FormatReader for CziReader {
         }
 
         let series = build_czi_series(&entries, &meta_xml, &used_files)?;
-        self.path = Some(used_files[0].clone());
+        self.path = sources
+            .first()
+            .and_then(SourceHandle::path)
+            .map(Path::to_path_buf);
         self.used_files = used_files;
+        self.sources = sources;
         self.entries = entries;
         self.meta_xml = meta_xml;
         self.series = series;
@@ -1218,6 +1302,7 @@ impl FormatReader for CziReader {
     fn close(&mut self) -> Result<()> {
         self.path = None;
         self.used_files.clear();
+        self.sources.clear();
         self.entries.clear();
         self.meta_xml.clear();
         self.series.clear();
@@ -1255,6 +1340,13 @@ impl FormatReader for CziReader {
 
     fn used_files(&self) -> Vec<PathBuf> {
         self.used_files.clone()
+    }
+
+    fn used_sources(&self) -> Vec<SourceInfo> {
+        self.sources
+            .iter()
+            .map(|source| source.info().clone())
+            .collect()
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -1337,8 +1429,16 @@ impl FormatReader for CziReader {
     }
 
     fn snapshot(&self) -> Result<ReaderSnapshot> {
+        if self.sources.is_empty() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        let path = self.path.clone().ok_or_else(|| {
+            BioFormatsError::SnapshotUnsupported(
+                "CZI reader initialized from application-provided sources".into(),
+            )
+        })?;
         Ok(ReaderSnapshot::CziReader(CziReaderSnapshot {
-            path: self.path.clone().ok_or(BioFormatsError::NotInitialized)?,
+            path,
             used_files: self.used_files.clone(),
             entries: self.entries.clone(),
             meta_xml: self.meta_xml.clone(),
@@ -1704,7 +1804,8 @@ mod tests {
             fs::write(&path, bytes).unwrap();
 
             let file = File::open(path).unwrap();
-            let error = match parse_czi_file(&mut BufReader::new(file)) {
+            let file_len = file.metadata().unwrap().len();
+            let error = match parse_czi_file(&mut BufReader::new(file), file_len) {
                 Err(error) => error,
                 Ok(_) => panic!("out-of-file CZI {name} segment was accepted"),
             };
@@ -1731,7 +1832,8 @@ mod tests {
         fs::write(&path, bytes).unwrap();
 
         let file = File::open(path).unwrap();
-        let error = match parse_czi_file(&mut BufReader::new(file)) {
+        let file_len = file.metadata().unwrap().len();
+        let error = match parse_czi_file(&mut BufReader::new(file), file_len) {
             Err(error) => error,
             Ok(_) => panic!("oversized CZI directory count was accepted"),
         };

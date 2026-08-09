@@ -30,7 +30,6 @@
  * #L%
  */
 
-use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -38,13 +37,18 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::{destination_prefix, try_zeroed_bytes, validate_region, FormatReader};
+use crate::source::{
+    map_source_io_error, CompanionReference, SourceHandle, SourceInfo, SourceInput,
+};
 use flate2::read::GzDecoder;
 
 const NRRD_MAGIC: &[u8] = b"NRRD";
 
 pub struct NrrdReader {
     current_path: Option<PathBuf>,
-    data_path: Option<PathBuf>,
+    header_source: Option<SourceHandle>,
+    data_source: Option<SourceHandle>,
+    used_sources: Vec<SourceInfo>,
     data_offset: u64,
     encoding: Option<Encoding>,
     metadata: ImageMetadata,
@@ -58,7 +62,7 @@ enum Encoding {
 
 struct ParsedHeader {
     metadata: ImageMetadata,
-    data_file: Option<PathBuf>,
+    data_file: Option<String>,
     data_offset: u64,
     encoding: Encoding,
 }
@@ -67,7 +71,9 @@ impl NrrdReader {
     pub fn new() -> Self {
         Self {
             current_path: None,
-            data_path: None,
+            header_source: None,
+            data_source: None,
+            used_sources: Vec::new(),
             data_offset: 0,
             encoding: None,
             metadata: ImageMetadata::default(),
@@ -93,8 +99,8 @@ impl NrrdReader {
         height: u32,
         destination: &mut [u8],
     ) -> Result<usize> {
-        let path = self
-            .data_path
+        let source = self
+            .data_source
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?;
         let bytes_per_pixel = bytes_per_sample(self.metadata.pixel_type)?
@@ -123,7 +129,6 @@ impl NrrdReader {
             .ok_or_else(|| invalid_data("X byte offset overflows u64"))?;
 
         let output = destination_prefix(destination, output_len)?;
-        let mut file = File::open(path)?;
         for row in 0..height {
             let source_y = u64::from(y)
                 .checked_add(u64::from(row))
@@ -133,7 +138,6 @@ impl NrrdReader {
                 .and_then(|value| value.checked_add(x_offset))
                 .and_then(|value| plane_start.checked_add(value))
                 .ok_or_else(|| invalid_data("row offset overflows u64"))?;
-            file.seek(SeekFrom::Start(row_offset))?;
             let destination_start = usize::try_from(row)
                 .ok()
                 .and_then(|value| value.checked_mul(output_row_bytes_usize))
@@ -141,7 +145,15 @@ impl NrrdReader {
             let destination_end = destination_start
                 .checked_add(output_row_bytes_usize)
                 .ok_or_else(|| invalid_data("destination row end overflows usize"))?;
-            read_exact_pixels(&mut file, &mut output[destination_start..destination_end])?;
+            source
+                .read_at(row_offset, &mut output[destination_start..destination_end])
+                .map_err(|error| {
+                    if matches!(error, BioFormatsError::SourceRangeOutOfBounds { .. }) {
+                        invalid_data("pixel data is truncated")
+                    } else {
+                        error
+                    }
+                })?;
         }
         Ok(output_len)
     }
@@ -155,8 +167,8 @@ impl NrrdReader {
         height: u32,
         destination: &mut [u8],
     ) -> Result<usize> {
-        let path = self
-            .data_path
+        let source = self
+            .data_source
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)?;
         let bytes_per_pixel = bytes_per_sample(self.metadata.pixel_type)?
@@ -191,7 +203,7 @@ impl NrrdReader {
             })
             .ok_or_else(|| invalid_data("decoded plane offset overflows u64"))?;
 
-        let mut file = File::open(path)?;
+        let mut file = source.cursor();
         file.seek(SeekFrom::Start(self.data_offset))?;
         let mut decoder = GzDecoder::new(file);
         skip_decoded(&mut decoder, decoded_start)?;
@@ -237,7 +249,7 @@ impl NrrdReader {
         height: u32,
         destination: &mut [u8],
     ) -> Result<usize> {
-        if self.current_path.is_none() {
+        if self.header_source.is_none() {
             return Err(BioFormatsError::NotInitialized);
         }
         if plane_index >= self.metadata.image_count {
@@ -262,7 +274,7 @@ impl NrrdReader {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>> {
-        if self.current_path.is_none() {
+        if self.header_source.is_none() {
             return Err(BioFormatsError::NotInitialized);
         }
         if plane_index >= self.metadata.image_count {
@@ -296,22 +308,42 @@ impl FormatReader for NrrdReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let parsed = parse_header(path)?;
-        let data_path = match parsed.data_file {
-            Some(data_file) if data_file.is_absolute() => data_file,
-            Some(data_file) => path
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(data_file),
-            None => path.to_path_buf(),
+        self.set_source(SourceInput::from_path(path)?)
+    }
+
+    fn set_source(&mut self, input: SourceInput) -> Result<()> {
+        let header_source = input.primary_handle()?;
+        let parsed = parse_header(&header_source)?;
+        let data_source = if let Some(reference) = parsed.data_file.as_deref() {
+            input
+                .resolve(&header_source, CompanionReference::Named(reference))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| BioFormatsError::CompanionNotFound {
+                    identity: header_source.info().identity().clone(),
+                    reference: reference.to_owned(),
+                })?
+        } else {
+            header_source.clone()
         };
         let mut metadata = parsed.metadata;
-        metadata.used_files = vec![path.to_path_buf()];
-        if data_path != path {
-            metadata.used_files.push(data_path.clone());
+        metadata.used_files = header_source
+            .path()
+            .map(Path::to_path_buf)
+            .into_iter()
+            .collect();
+        if data_source.info().identity() != header_source.info().identity() {
+            if let Some(path) = data_source.path() {
+                metadata.used_files.push(path.to_path_buf());
+            }
         }
-        self.current_path = Some(path.to_path_buf());
-        self.data_path = Some(data_path);
+        self.current_path = header_source.path().map(Path::to_path_buf);
+        self.used_sources = vec![header_source.info().clone()];
+        if data_source.info().identity() != header_source.info().identity() {
+            self.used_sources.push(data_source.info().clone());
+        }
+        self.header_source = Some(header_source);
+        self.data_source = Some(data_source);
         self.data_offset = parsed.data_offset;
         self.encoding = Some(parsed.encoding);
         self.metadata = metadata;
@@ -320,7 +352,9 @@ impl FormatReader for NrrdReader {
 
     fn close(&mut self) -> Result<()> {
         self.current_path = None;
-        self.data_path = None;
+        self.header_source = None;
+        self.data_source = None;
+        self.used_sources.clear();
         self.data_offset = 0;
         self.encoding = None;
         self.metadata = ImageMetadata::default();
@@ -353,6 +387,10 @@ impl FormatReader for NrrdReader {
 
     fn used_files(&self) -> Vec<PathBuf> {
         self.metadata.used_files.clone()
+    }
+
+    fn used_sources(&self) -> Vec<SourceInfo> {
+        self.used_sources.clone()
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -408,14 +446,13 @@ impl FormatReader for NrrdReader {
     }
 }
 
-fn parse_header(path: &Path) -> Result<ParsedHeader> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
+fn parse_header(source: &SourceHandle) -> Result<ParsedHeader> {
+    let mut reader = BufReader::new(source.cursor());
     let mut line = String::new();
     let first_len = reader.read_line(&mut line)?;
     if first_len == 0 || !line.as_bytes().starts_with(NRRD_MAGIC) {
         return Err(BioFormatsError::UnsupportedFormat(
-            path.display().to_string(),
+            source.info().name().to_owned(),
         ));
     }
     if line.trim_end_matches(['\r', '\n']).len() < 8 {
@@ -496,7 +533,7 @@ fn parse_header(path: &Path) -> Result<ParsedHeader> {
                         "NRRD LIST data files are not supported".into(),
                     ));
                 }
-                data_file = Some(PathBuf::from(value));
+                data_file = Some(value.to_owned());
             }
             _ => {}
         }
@@ -653,16 +690,6 @@ fn bytes_per_sample(pixel_type: PixelType) -> Result<u64> {
     }
 }
 
-fn read_exact_pixels(reader: &mut impl Read, destination: &mut [u8]) -> Result<()> {
-    reader.read_exact(destination).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::UnexpectedEof {
-            invalid_data("pixel data is truncated")
-        } else {
-            BioFormatsError::Io(error)
-        }
-    })
-}
-
 fn skip_decoded(reader: &mut impl Read, mut count: u64) -> Result<()> {
     let mut scratch = [0_u8; 8192];
     while count > 0 {
@@ -670,7 +697,7 @@ fn skip_decoded(reader: &mut impl Read, mut count: u64) -> Result<()> {
             .map_err(|_| invalid_data("gzip skip length does not fit usize"))?;
         let read = reader
             .read(&mut scratch[..chunk])
-            .map_err(|error| BioFormatsError::Codec(format!("NRRD gzip decode failed: {error}")))?;
+            .map_err(nrrd_gzip_error)?;
         if read == 0 {
             return Err(invalid_data("gzip pixel data is truncated"));
         }
@@ -682,12 +709,21 @@ fn skip_decoded(reader: &mut impl Read, mut count: u64) -> Result<()> {
 
 fn read_exact_decoded(reader: &mut impl Read, destination: &mut [u8]) -> Result<()> {
     reader.read_exact(destination).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof && error.get_ref().is_none() {
             invalid_data("gzip pixel data is truncated")
         } else {
-            BioFormatsError::Codec(format!("NRRD gzip decode failed: {error}"))
+            nrrd_gzip_error(error)
         }
     })
+}
+
+fn nrrd_gzip_error(error: std::io::Error) -> BioFormatsError {
+    match map_source_io_error(error) {
+        BioFormatsError::Io(error) => {
+            BioFormatsError::Codec(format!("NRRD gzip decode failed: {error}"))
+        }
+        source_error => source_error,
+    }
 }
 
 fn invalid_data(message: impl Into<String>) -> BioFormatsError {

@@ -24,14 +24,13 @@
 //! the requested rows and columns from the file.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::{destination_prefix, try_zeroed_bytes, validate_region, FormatReader};
+use crate::source::{SourceHandle, SourceInfo, SourceInput};
 
 const HEADER_SIZE: usize = 1024;
 const EXT_HEADER_SIZE_OFFSET: usize = 92;
@@ -246,7 +245,7 @@ fn insert_float(metadata: &mut HashMap<String, MetadataValue>, key: &str, value:
     metadata.insert(key.to_string(), MetadataValue::Float(f64::from(value)));
 }
 
-fn build_metadata(header: &[u8], parsed: ParsedHeader, path: &Path) -> ImageMetadata {
+fn build_metadata(header: &[u8], parsed: ParsedHeader, path: Option<&Path>) -> ImageMetadata {
     let order = parsed.order;
     let read_i32 = |offset: usize| order.read_i32(&header[offset..offset + 4]);
     let read_i16 = |offset: usize| order.read_i16(&header[offset..offset + 2]);
@@ -366,13 +365,13 @@ fn build_metadata(header: &[u8], parsed: ParsedHeader, path: &Path) -> ImageMeta
         physical_size_x_um: physical_size_um(xlen, mx, agar),
         physical_size_y_um: physical_size_um(ylen, my, agar),
         physical_size_z_um: physical_size_um(zlen, mz, agar),
-        used_files: vec![path.to_path_buf()],
+        used_files: path.into_iter().map(Path::to_path_buf).collect(),
         ..ImageMetadata::default()
     }
 }
 
 pub struct MrcReader {
-    file: Option<BufReader<File>>,
+    source: Option<SourceHandle>,
     path: Option<PathBuf>,
     metadata: Option<ImageMetadata>,
     parsed: Option<ParsedHeader>,
@@ -381,7 +380,7 @@ pub struct MrcReader {
 impl MrcReader {
     pub fn new() -> Self {
         Self {
-            file: None,
+            source: None,
             path: None,
             metadata: None,
             parsed: None,
@@ -441,7 +440,10 @@ impl MrcReader {
             .ok_or_else(|| BioFormatsError::InvalidData("MRC plane offset overflow".into()))?;
 
         let output = destination_prefix(destination, output_len)?;
-        let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+        let source = self
+            .source
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
         for output_row in 0..height {
             let source_row = parsed
                 .height
@@ -459,12 +461,14 @@ impl MrcReader {
                 )
                 .and_then(|offset| offset.checked_add(x_offset))
                 .ok_or_else(|| BioFormatsError::InvalidData("MRC row offset overflow".into()))?;
-            file.seek(SeekFrom::Start(source_offset))?;
             let destination = usize::try_from(output_row)
                 .ok()
                 .and_then(|row| row.checked_mul(output_row_bytes))
                 .ok_or_else(|| BioFormatsError::InvalidData("MRC output offset overflow".into()))?;
-            file.read_exact(&mut output[destination..destination + output_row_bytes])?;
+            source.read_at(
+                source_offset,
+                &mut output[destination..destination + output_row_bytes],
+            )?;
         }
         Ok(output_len)
     }
@@ -524,23 +528,25 @@ impl FormatReader for MrcReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file = File::open(path)?;
-        let file_len = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
-        let mut raw_header = [0; HEADER_SIZE];
-        reader.read_exact(&mut raw_header)?;
-        let parsed = parse_header(&raw_header, file_len)?;
-        let metadata = build_metadata(&raw_header, parsed, path);
+        self.set_source(SourceInput::from_path(path)?)
+    }
 
-        self.file = Some(reader);
-        self.path = Some(path.to_path_buf());
+    fn set_source(&mut self, input: SourceInput) -> Result<()> {
+        let source = input.primary_handle()?;
+        let raw_header = source.read_prefix(HEADER_SIZE)?;
+        let parsed = parse_header(&raw_header, source.info().len())?;
+        let path = source.path().map(Path::to_path_buf);
+        let metadata = build_metadata(&raw_header, parsed, path.as_deref());
+
+        self.source = Some(source);
+        self.path = path;
         self.metadata = Some(metadata);
         self.parsed = Some(parsed);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.file = None;
+        self.source = None;
         self.path = None;
         self.metadata = None;
         self.parsed = None;
@@ -573,6 +579,13 @@ impl FormatReader for MrcReader {
 
     fn used_files(&self) -> Vec<PathBuf> {
         self.path.iter().cloned().collect()
+    }
+
+    fn used_sources(&self) -> Vec<SourceInfo> {
+        self.source
+            .iter()
+            .map(|source| source.info().clone())
+            .collect()
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

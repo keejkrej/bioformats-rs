@@ -8,7 +8,6 @@
 //! Compression: raw bytes or zlib. JPEG2000 is detected but not decoded.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +18,7 @@ use crate::common::metadata::{
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::{validate_region, FormatReader};
 use crate::snapshot::ReaderSnapshot;
+use crate::source::{map_source_io_error, SourceHandle, SourceInfo, SourceInput};
 use roxmltree::{Document, Node};
 use serde::{Deserialize, Serialize};
 
@@ -34,9 +34,8 @@ pub struct Nd2Chunk {
     data_length: u64,
 }
 
-fn scan_chunks(file: &mut BufReader<File>) -> std::io::Result<Vec<Nd2Chunk>> {
+fn scan_chunks<R: Read + Seek>(file: &mut R, file_len: u64) -> std::io::Result<Vec<Nd2Chunk>> {
     let mut chunks = Vec::new();
-    let file_len = file.get_ref().metadata()?.len();
     let mut search_from = 0_u64;
 
     while let Some(chunk_start) = find_next_magic(file, search_from, file_len)? {
@@ -49,10 +48,15 @@ fn scan_chunks(file: &mut BufReader<File>) -> std::io::Result<Vec<Nd2Chunk>> {
 
         let mut name_len_bytes = [0_u8; 4];
         let mut data_len_bytes = [0_u8; 8];
-        if file.read_exact(&mut name_len_bytes).is_err()
-            || file.read_exact(&mut data_len_bytes).is_err()
-        {
-            break;
+        match file.read_exact(&mut name_len_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
+        }
+        match file.read_exact(&mut data_len_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error),
         }
         let name_len = u64::from(u32::from_le_bytes(name_len_bytes));
         let data_len = u64::from_le_bytes(data_len_bytes);
@@ -106,8 +110,8 @@ fn scan_chunks(file: &mut BufReader<File>) -> std::io::Result<Vec<Nd2Chunk>> {
     Ok(chunks)
 }
 
-fn find_next_magic(
-    file: &mut BufReader<File>,
+fn find_next_magic<R: Read + Seek>(
+    file: &mut R,
     start: u64,
     file_len: u64,
 ) -> std::io::Result<Option<u64>> {
@@ -136,7 +140,7 @@ fn find_next_magic(
     }
 }
 
-fn read_chunk_data(file: &mut BufReader<File>, chunk: &Nd2Chunk) -> std::io::Result<Vec<u8>> {
+fn read_chunk_data<R: Read + Seek>(file: &mut R, chunk: &Nd2Chunk) -> std::io::Result<Vec<u8>> {
     file.seek(SeekFrom::Start(chunk.data_offset))?;
     let data_length = usize::try_from(chunk.data_length).map_err(|_| {
         std::io::Error::new(
@@ -1306,7 +1310,7 @@ pub struct Nd2Series {
 }
 
 pub struct Nd2Reader {
-    file: Option<BufReader<File>>,
+    source: Option<SourceHandle>,
     path: Option<PathBuf>,
     chunks: Vec<Nd2Chunk>,
     image_chunks: Vec<usize>,
@@ -1497,7 +1501,7 @@ fn extract_component(data: &[u8], series: &Nd2Series, component: u32) -> Result<
 impl Nd2Reader {
     pub fn new() -> Self {
         Self {
-            file: None,
+            source: None,
             path: None,
             chunks: Vec::new(),
             image_chunks: Vec::new(),
@@ -1507,9 +1511,9 @@ impl Nd2Reader {
     }
 
     pub fn from_snapshot(snapshot: Nd2ReaderSnapshot) -> Result<Self> {
-        let file = File::open(&snapshot.path).map_err(BioFormatsError::Io)?;
+        let source = SourceInput::from_path(&snapshot.path)?.primary_handle()?;
         Ok(Self {
-            file: Some(BufReader::new(file)),
+            source: Some(source),
             path: Some(snapshot.path),
             chunks: snapshot.chunks,
             image_chunks: snapshot.image_chunks,
@@ -1518,48 +1522,57 @@ impl Nd2Reader {
         })
     }
 
-    fn collect_metadata_fragments(file: &mut BufReader<File>, chunks: &[Nd2Chunk]) -> Vec<String> {
+    fn collect_metadata_fragments<R: Read + Seek>(
+        file: &mut R,
+        chunks: &[Nd2Chunk],
+    ) -> Result<Vec<String>> {
         Self::collect_metadata_fragments_where(file, chunks, |_| true)
     }
 
-    fn collect_metadata_fragments_where(
-        file: &mut BufReader<File>,
+    fn collect_metadata_fragments_where<R: Read + Seek>(
+        file: &mut R,
         chunks: &[Nd2Chunk],
         predicate: impl Fn(&Nd2Chunk) -> bool,
-    ) -> Vec<String> {
-        chunks
+    ) -> Result<Vec<String>> {
+        let mut fragments = Vec::new();
+        for chunk in chunks
             .iter()
             .filter(|chunk| is_textual_metadata_chunk(&chunk.name))
             .filter(|chunk| chunk.data_length <= MAX_METADATA_CHUNK_BYTES)
             .filter(|chunk| predicate(chunk))
-            .filter_map(|chunk| read_chunk_data(file, chunk).ok())
-            .filter(|data| looks_like_xml(data))
-            .filter_map(|data| String::from_utf8(data).ok())
-            .collect()
+        {
+            let data = read_chunk_data(file, chunk).map_err(map_source_io_error)?;
+            if looks_like_xml(&data) {
+                if let Ok(fragment) = String::from_utf8(data) {
+                    fragments.push(fragment);
+                }
+            }
+        }
+        Ok(fragments)
     }
 
-    fn collect_lv_values(
-        file: &mut BufReader<File>,
+    fn collect_lv_values<R: Read + Seek>(
+        file: &mut R,
         chunks: &[Nd2Chunk],
-    ) -> (
+    ) -> Result<(
         Vec<(String, LvValue)>,
         Vec<Nd2ChannelColor>,
         Vec<Nd2AcquisitionCandidate>,
         u32,
-    ) {
+    )> {
         Self::collect_lv_values_where(file, chunks, |_| true)
     }
 
-    fn collect_lv_values_where(
-        file: &mut BufReader<File>,
+    fn collect_lv_values_where<R: Read + Seek>(
+        file: &mut R,
         chunks: &[Nd2Chunk],
         predicate: impl Fn(&Nd2Chunk) -> bool,
-    ) -> (
+    ) -> Result<(
         Vec<(String, LvValue)>,
         Vec<Nd2ChannelColor>,
         Vec<Nd2AcquisitionCandidate>,
         u32,
-    ) {
+    )> {
         let mut values = Vec::new();
         let mut channel_colors = Vec::new();
         let mut acquisition_candidates = Vec::new();
@@ -1570,9 +1583,7 @@ impl Nd2Reader {
             .filter(|chunk| chunk.data_length <= MAX_METADATA_CHUNK_BYTES)
             .filter(|chunk| predicate(chunk))
         {
-            let Ok(data) = read_chunk_data(file, chunk) else {
-                continue;
-            };
+            let data = read_chunk_data(file, chunk).map_err(map_source_io_error)?;
             let stop = data.len();
             let mut chunk_values = Vec::new();
             let mut chunk_roots = Vec::new();
@@ -1608,12 +1619,12 @@ impl Nd2Reader {
                 candidate.singleton_c_after_z = true;
             }
         }
-        (
+        Ok((
             values,
             channel_colors,
             acquisition_candidates,
             experiment_roots,
-        )
+        ))
     }
 
     fn build_series(model: &Nd2MetadataModel, image_chunks: &[usize]) -> Result<Vec<Nd2Series>> {
@@ -1952,9 +1963,14 @@ impl FormatReader for Nd2Reader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file = File::open(path).map_err(BioFormatsError::Io)?;
-        let mut reader = BufReader::new(file);
-        let chunks = scan_chunks(&mut reader).map_err(BioFormatsError::Io)?;
+        self.set_source(SourceInput::from_path(path)?)
+    }
+
+    fn set_source(&mut self, input: SourceInput) -> Result<()> {
+        let source = input.primary_handle()?;
+        let mut reader = BufReader::new(source.cursor());
+        let chunks =
+            scan_chunks(&mut reader, source.info().len()).map_err(BioFormatsError::from)?;
         let mut numbered_image_chunks = chunks
             .iter()
             .enumerate()
@@ -1983,16 +1999,16 @@ impl FormatReader for Nd2Reader {
             .map(|(_, chunk_index)| chunk_index)
             .collect::<Vec<_>>();
 
-        let fragments = Self::collect_metadata_fragments(&mut reader, &chunks);
+        let fragments = Self::collect_metadata_fragments(&mut reader, &chunks)?;
         let mut metadata = parse_nd2_text_metadata(&fragments);
         let attribute_fragments =
             Self::collect_metadata_fragments_where(&mut reader, &chunks, |chunk| {
                 chunk.name.starts_with("ImageAttributes")
-            });
+            })?;
         let text_attributes = parse_nd2_text_metadata(&attribute_fragments);
         apply_image_attributes(&mut metadata, &text_attributes);
         let (lv_values, lv_channel_colors, lv_candidates, lv_experiment_roots) =
-            Self::collect_lv_values(&mut reader, &chunks);
+            Self::collect_lv_values(&mut reader, &chunks)?;
         let mut lv_metadata = parse_nd2_lv_metadata(&lv_values);
         lv_metadata.channel_colors = lv_channel_colors;
         lv_metadata.acquisition_order = lv_candidates
@@ -2005,7 +2021,7 @@ impl FormatReader for Nd2Reader {
         let (attribute_values, _, _, _) =
             Self::collect_lv_values_where(&mut reader, &chunks, |chunk| {
                 chunk.name.starts_with("ImageAttributesLV")
-            });
+            })?;
         let attributes = parse_nd2_lv_metadata(&attribute_values);
         apply_image_attributes(&mut metadata, &attributes);
         reconcile_acquisition_dimensions(&mut metadata, image_chunks.len())?;
@@ -2018,8 +2034,8 @@ impl FormatReader for Nd2Reader {
         }
 
         let series = Self::build_series(&metadata, &image_chunks)?;
-        self.file = Some(reader);
-        self.path = Some(path.to_path_buf());
+        self.path = source.path().map(Path::to_path_buf);
+        self.source = Some(source);
         self.chunks = chunks;
         self.image_chunks = image_chunks;
         self.series = series;
@@ -2028,7 +2044,7 @@ impl FormatReader for Nd2Reader {
     }
 
     fn close(&mut self) -> Result<()> {
-        self.file = None;
+        self.source = None;
         self.path = None;
         self.chunks.clear();
         self.image_chunks.clear();
@@ -2065,6 +2081,17 @@ impl FormatReader for Nd2Reader {
         self.path.as_deref()
     }
 
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.path.iter().cloned().collect()
+    }
+
+    fn used_sources(&self) -> Vec<SourceInfo> {
+        self.source
+            .iter()
+            .map(|source| source.info().clone())
+            .collect()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         let series = self.current_series()?.clone();
         if plane_index >= series.metadata.image_count {
@@ -2079,8 +2106,12 @@ impl FormatReader for Nd2Reader {
             .chunks
             .get(plane.chunk_index)
             .ok_or(BioFormatsError::PlaneOutOfRange(plane_index))?;
-        let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
-        let data = read_chunk_data(file, chunk).map_err(BioFormatsError::Io)?;
+        let source = self
+            .source
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
+        let mut reader = source.cursor();
+        let data = read_chunk_data(&mut reader, chunk).map_err(BioFormatsError::from)?;
         let physical = decode_physical_plane(&data, &series)?;
         extract_component(&physical, &series, plane.component)
     }
@@ -2132,8 +2163,16 @@ impl FormatReader for Nd2Reader {
     }
 
     fn snapshot(&self) -> Result<ReaderSnapshot> {
+        if self.source.is_none() {
+            return Err(BioFormatsError::NotInitialized);
+        }
+        let path = self.path.clone().ok_or_else(|| {
+            BioFormatsError::SnapshotUnsupported(
+                "ND2 reader initialized from an application-provided source".into(),
+            )
+        })?;
         Ok(ReaderSnapshot::Nd2Reader(Nd2ReaderSnapshot {
-            path: self.path.clone().ok_or(BioFormatsError::NotInitialized)?,
+            path,
             chunks: self.chunks.clone(),
             image_chunks: self.image_chunks.clone(),
             series: self.series.clone(),

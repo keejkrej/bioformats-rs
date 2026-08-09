@@ -28,7 +28,7 @@ fn read_decoded_limited(
     reader
         .take(limit)
         .read_to_end(&mut output)
-        .map_err(BioFormatsError::Io)?;
+        .map_err(BioFormatsError::from)?;
     if output.len() > maximum_length {
         return Err(BioFormatsError::Codec(format!(
             "{context} output exceeds the expected {maximum_length} bytes"
@@ -101,7 +101,9 @@ pub fn decompress_deflate(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut decoder = ZlibDecoder::new(data);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(BioFormatsError::Io)?;
+    decoder
+        .read_to_end(&mut out)
+        .map_err(BioFormatsError::from)?;
     Ok(out)
 }
 
@@ -119,7 +121,9 @@ pub fn decompress_deflate_raw(data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut decoder = DeflateDecoder::new(data);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).map_err(BioFormatsError::Io)?;
+    decoder
+        .read_to_end(&mut out)
+        .map_err(BioFormatsError::from)?;
     Ok(out)
 }
 
@@ -241,11 +245,11 @@ pub fn decompress_jpeg_limited(data: &[u8], maximum_length: usize) -> Result<Vec
 
 /// Decompress Zstd data.
 pub fn decompress_zstd(data: &[u8]) -> Result<Vec<u8>> {
-    zstd::decode_all(data).map_err(BioFormatsError::Io)
+    zstd::decode_all(data).map_err(BioFormatsError::from)
 }
 
 pub fn decompress_zstd_limited(data: &[u8], maximum_length: usize) -> Result<Vec<u8>> {
-    let decoder = zstd::stream::read::Decoder::new(data).map_err(BioFormatsError::Io)?;
+    let decoder = zstd::stream::read::Decoder::new(data).map_err(BioFormatsError::from)?;
     read_decoded_limited(decoder, maximum_length, "Zstd")
 }
 

@@ -2,7 +2,7 @@
 #[derive(thiserror::Error, Debug)]
 pub enum BioFormatsError {
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
     #[error("Format error: {0}")]
     Format(String),
     #[error("Unsupported format: {0}")]
@@ -58,6 +58,58 @@ pub enum BioFormatsError {
     PlaneByteCountMismatch { expected: usize, actual: usize },
     #[error("Reader state is unavailable after another thread panicked")]
     ReaderStatePoisoned,
+    #[error("Source {identity} changed its identity, name, or length while open")]
+    SourceChanged { identity: crate::source::SourceId },
+    #[error("Source {identity} range {offset}+{length} overflows u64")]
+    SourceRangeOverflow {
+        identity: crate::source::SourceId,
+        offset: u64,
+        length: u64,
+    },
+    #[error(
+        "Source {identity} range {offset}..{end} exceeds source length {source_len}",
+        end = offset.saturating_add(*length)
+    )]
+    SourceRangeOutOfBounds {
+        identity: crate::source::SourceId,
+        offset: u64,
+        length: u64,
+        source_len: u64,
+    },
+    #[error("Source {identity} failed to read range {offset}+{length}: {source}")]
+    SourceRead {
+        identity: crate::source::SourceId,
+        offset: u64,
+        length: u64,
+        #[source]
+        source: crate::source::SourceError,
+    },
+    #[error("Companion resolution from {identity} for {reference:?} failed: {source}")]
+    CompanionResolution {
+        identity: crate::source::SourceId,
+        reference: String,
+        #[source]
+        source: crate::source::SourceError,
+    },
+    #[error(
+        "Companion resolution from {identity} for {reference:?} returned {count} sources; expected at most one"
+    )]
+    CompanionAmbiguous {
+        identity: crate::source::SourceId,
+        reference: String,
+        count: usize,
+    },
+    #[error("Required companion {reference:?} was not found for source {identity}")]
+    CompanionNotFound {
+        identity: crate::source::SourceId,
+        reference: String,
+    },
+}
+
+impl From<std::io::Error> for BioFormatsError {
+    fn from(error: std::io::Error) -> Self {
+        crate::source::map_source_io_error(error)
+    }
 }
 
 pub type Result<T> = std::result::Result<T, BioFormatsError>;

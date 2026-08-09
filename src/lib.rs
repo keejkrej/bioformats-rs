@@ -28,12 +28,13 @@ pub mod pixel;
 pub mod reader;
 pub mod registry;
 pub mod snapshot;
+pub mod source;
 pub mod tiff;
 pub mod wrappers;
 
 pub use dataset::{
-    open, Dataset, PixelLayout, Plane, PlaneCoordinates, PlaneInfo, ReadRequest, Rect, Region,
-    Resolution, Series,
+    open, open_source, Dataset, PixelLayout, Plane, PlaneCoordinates, PlaneInfo, ReadRequest, Rect,
+    Region, Resolution, Series,
 };
 pub use error::{BioFormatsError, Result};
 pub use metadata::{
@@ -44,6 +45,10 @@ pub use pixel::PixelType;
 pub use reader::FormatReader;
 pub use registry::{FormatId, ImageReader, SUPPORTED_FORMATS};
 pub use snapshot::ReaderSnapshot;
+pub use source::{
+    CompanionReference, CompanionResolver, RandomAccessSource, SourceError, SourceId, SourceInfo,
+    SourceInput, SourceResult,
+};
 pub use tiff::TiffReader;
 pub use wrappers::{
     ChannelFiller, ChannelMerger, ChannelSeparator, DimensionSwapper, FileStitcher,

@@ -35,6 +35,14 @@ families are exercised through both the low-level reader and the
 application-facing request API. Fixture-gated tests are ignored in the default
 test run so the repository remains self-contained.
 
+All six implemented reader families also run through an application-owned
+`RandomAccessSource`: TIFF/OME-TIFF, ND2, CZI, NRRD, MRC, and DCIMG. Integration
+tests record bounded TIFF ranges, reject a source with a malformed declared
+range, share one `Dataset` across threads, resolve detached NRRD data and
+multi-file OME-TIFF by name, and resolve/de-duplicate/order split CZI siblings.
+The filesystem path APIs exercise the same reader code through the built-in
+source and resolver adapters.
+
 ## Library boundary
 
 The stable application-facing direction is `Dataset` plus explicit
@@ -52,9 +60,23 @@ to `f32`, lazily page planes, or eagerly materialize an entire tensor. Keeping
 that policy in the application avoids forcing every integrator into the same
 memory and precision tradeoffs.
 
-The current integration boundary is path-based. A future byte/custom-storage
-source needs both random read-at access and a companion-file resolver; it should
-not be faked by loading every dataset into one in-memory blob.
+The storage boundary is `SourceInput`, containing one primary
+`RandomAccessSource` and an optional `CompanionResolver`. Sources expose an exact
+bounded read-at operation, length, stable identity, logical name, and thread
+safety. Readers retain source handles and issue range reads without creating
+temporary files or preloading the complete dataset. Resolver `Named` lookups
+cover explicit references (detached NRRD and OME-TIFF); complete `Siblings`
+lookups cover implicit split sets (CZI). `Dataset::used_sources` is authoritative
+for this boundary, while `used_files` intentionally reports only real paths.
+
+No implemented reader requires filesystem storage for opening, metadata, or
+pixel reads. Filesystem-specific behavior remains in the convenience path
+adapter and its automatic relative/sibling discovery, persisted reader
+snapshots and memoizer rebinding, and path-oriented helpers such as file-pattern
+stitching. Application-owned sources must be rebound by the application after a
+restart; snapshot requests return `SnapshotUnsupported`. Format gaps in the
+matrix above remain format gaps regardless of storage—for example ND2 JPEG 2000,
+CZI JPEG-XR/pyramids, and DCIMG multi-file Z grouping are still unsupported.
 
 ## Deliberate non-goals
 

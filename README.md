@@ -50,9 +50,41 @@ transforms.
 format implementations, wrappers, and Java parity work. Their mutable methods
 follow the initialized-reader contract; embedders should prefer `Dataset`.
 
-Opening is currently filesystem/path based, including companion-file discovery.
-Byte-backed integration will require a random-access source plus a companion
-resolver rather than only a `Read` stream.
+`open(path)` and `Dataset::open(path)` remain the convenient filesystem entry
+points. Applications that already own their storage can instead use
+`open_source(SourceInput)`. A `RandomAccessSource` supplies an immutable
+`SourceInfo` (stable identity, logical name, and length) and exact bounded
+`read_at` operations. It is `Send + Sync`; the library checks every range before
+calling it and retains the source for lazy pixel reads.
+
+```rust,no_run
+use std::sync::Arc;
+use bioformats_rs::{open_source, RandomAccessSource, SourceInput};
+
+# fn open_owned(source: Arc<dyn RandomAccessSource>) -> bioformats_rs::Result<()> {
+let dataset = open_source(SourceInput::new(source))?;
+let sources = dataset.used_sources();
+assert_eq!(sources.len(), 1);
+# Ok(())
+# }
+```
+
+For detached or split datasets, attach a `CompanionResolver`. `Named` requests
+resolve metadata-declared members such as NRRD data files and OME-TIFF planes;
+`Siblings` requests provide the complete candidate set for convention-based
+datasets such as split CZI. The logical name is a naming and format hint, not a
+filesystem path. The filesystem APIs are adapters over the same source and
+resolver boundary—custom sources are never copied to temporary files or
+silently materialized as one complete byte buffer. See the compiling
+[`application_source` example](examples/application_source.rs) for an adapter to
+an application-owned range store.
+
+`Dataset::used_sources` reports every resolved source identity. `used_files`
+remains available for backwards compatibility and contains only actual
+filesystem paths, so it is empty for purely application-owned datasets.
+Persisted reader snapshots and memoizer cache rebinding remain path-oriented;
+snapshotting an application-owned source returns a recoverable
+`SnapshotUnsupported` error.
 
 ## Porting rules
 

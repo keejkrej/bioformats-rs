@@ -7,10 +7,16 @@ use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::ImageMetadata;
 use crate::common::pixel_type::PixelType;
 use crate::registry::{FormatId, ImageReader};
+use crate::source::{SourceInfo, SourceInput};
 
 /// Open a dataset with the built-in format registry.
 pub fn open(path: impl AsRef<Path>) -> Result<Dataset> {
     Dataset::open(path)
+}
+
+/// Open a dataset from an application-owned random-access source.
+pub fn open_source(input: SourceInput) -> Result<Dataset> {
+    Dataset::open_source(input)
 }
 
 /// Metadata for one source series and all of its pyramid resolutions.
@@ -184,14 +190,23 @@ pub struct Dataset {
     reader: Mutex<ImageReader>,
     format: FormatId,
     used_files: Vec<PathBuf>,
+    used_sources: Vec<SourceInfo>,
     series: Vec<Series>,
 }
 
 impl Dataset {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut reader = ImageReader::open(path.as_ref())?;
+        Self::from_reader(ImageReader::open(path.as_ref())?)
+    }
+
+    pub fn open_source(input: SourceInput) -> Result<Self> {
+        Self::from_reader(ImageReader::open_source(input)?)
+    }
+
+    fn from_reader(mut reader: ImageReader) -> Result<Self> {
         let format = reader.format().ok_or(BioFormatsError::NotInitialized)?;
         let used_files = reader.used_files();
+        let used_sources = reader.used_sources();
 
         reader.set_flattened_resolutions(false)?;
         let series_count = reader.series_count();
@@ -237,6 +252,7 @@ impl Dataset {
             reader: Mutex::new(reader),
             format,
             used_files,
+            used_sources,
             series: series_metadata,
         })
     }
@@ -247,6 +263,11 @@ impl Dataset {
 
     pub fn used_files(&self) -> &[PathBuf] {
         &self.used_files
+    }
+
+    /// Stable identities and logical names of every source used by the dataset.
+    pub fn used_sources(&self) -> &[SourceInfo] {
+        &self.used_sources
     }
 
     pub fn series(&self) -> &[Series] {

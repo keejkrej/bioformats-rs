@@ -29,14 +29,14 @@
 //! incorporates the bounded-region and overflow checks exercised by the
 //! `bioformats-zig` DCIMG reader.
 
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{DimensionOrder, ImageMetadata, MetadataValue};
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::{destination_prefix, try_zeroed_bytes, validate_region, FormatReader};
+use crate::source::{SourceHandle, SourceInfo, SourceInput};
 
 const SIGNATURE: &[u8; 5] = b"DCIMG";
 const VERSION_0: u32 = 0x0000_0007;
@@ -89,7 +89,7 @@ struct FourPixelCorrection {
 
 /// Reader for Hamamatsu DCIMG version 0 and version 1 files.
 pub struct DcimgReader {
-    file: Option<BufReader<File>>,
+    source: Option<SourceHandle>,
     path: Option<PathBuf>,
     header: Option<DcimgHeader>,
     metadata: Option<ImageMetadata>,
@@ -98,7 +98,7 @@ pub struct DcimgReader {
 impl DcimgReader {
     pub fn new() -> Self {
         Self {
-            file: None,
+            source: None,
             path: None,
             header: None,
             metadata: None,
@@ -145,7 +145,10 @@ impl DcimgReader {
         let frame_start = header.frame_start(plane_index)?;
 
         let output = destination_prefix(destination, output_len)?;
-        let file = self.file.as_mut().ok_or(BioFormatsError::NotInitialized)?;
+        let source = self
+            .source
+            .as_ref()
+            .ok_or(BioFormatsError::NotInitialized)?;
 
         // Bio-Formats treats `y` as a row in the stored image and reverses only
         // the requested row window while copying it into the caller's buffer.
@@ -171,7 +174,7 @@ impl DcimgReader {
                 .checked_add(output_row_bytes)
                 .ok_or_else(|| invalid_data("destination row range overflows"))?;
             let destination = &mut output[destination_start..destination_end];
-            read_exact_at(file, source_offset, destination, "pixel row")?;
+            source.read_at(source_offset, destination)?;
 
             if let Some(correction) = header.four_pixel_correction {
                 if output_row == correction.output_row && x < 4 {
@@ -193,12 +196,7 @@ impl DcimgReader {
                         )?,
                         "four-pixel correction offset",
                     )?;
-                    read_exact_at(
-                        file,
-                        correction_offset,
-                        &mut destination[..corrected_bytes],
-                        "four-pixel correction",
-                    )?;
+                    source.read_at(correction_offset, &mut destination[..corrected_bytes])?;
                 }
             }
         }
@@ -254,10 +252,14 @@ impl FormatReader for DcimgReader {
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let file = File::open(path).map_err(BioFormatsError::Io)?;
-        let file_len = file.metadata().map_err(BioFormatsError::Io)?.len();
-        let mut file = BufReader::new(file);
-        let header = parse_header(&mut file, file_len)?;
+        self.set_source(SourceInput::from_path(path)?)
+    }
+
+    fn set_source(&mut self, input: SourceInput) -> Result<()> {
+        let source = input.primary_handle()?;
+        let mut cursor = source.cursor();
+        let header = parse_header(&mut cursor, source.info().len())?;
+        let path = source.path().map(Path::to_path_buf);
 
         let mut metadata = ImageMetadata {
             size_x: header.width,
@@ -275,7 +277,7 @@ impl FormatReader for DcimgReader {
             is_indexed: false,
             is_false_color: false,
             is_little_endian: true,
-            used_files: vec![path.to_path_buf()],
+            used_files: path.iter().cloned().collect(),
             ..ImageMetadata::default()
         };
         metadata.series_metadata.insert(
@@ -283,15 +285,15 @@ impl FormatReader for DcimgReader {
             MetadataValue::Int(i64::from(header.version_number)),
         );
 
-        self.file = Some(file);
-        self.path = Some(path.to_path_buf());
+        self.source = Some(source);
+        self.path = path;
         self.header = Some(header);
         self.metadata = Some(metadata);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.file = None;
+        self.source = None;
         self.path = None;
         self.header = None;
         self.metadata = None;
@@ -326,6 +328,13 @@ impl FormatReader for DcimgReader {
 
     fn used_files(&self) -> Vec<PathBuf> {
         self.path.iter().cloned().collect()
+    }
+
+    fn used_sources(&self) -> Vec<SourceInfo> {
+        self.source
+            .iter()
+            .map(|source| source.info().clone())
+            .collect()
     }
 
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -692,7 +701,7 @@ fn read_exact_at<R: Read + Seek>(
 ) -> Result<()> {
     reader
         .seek(SeekFrom::Start(offset))
-        .map_err(BioFormatsError::Io)?;
+        .map_err(BioFormatsError::from)?;
     reader.read_exact(destination).map_err(|error| {
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
             invalid_data(format!("truncated {field}"))

@@ -7,65 +7,65 @@ use crate::error::Result;
 /// Read a u16 with the given endianness.
 pub fn read_u16<R: Read>(r: &mut R, little_endian: bool) -> Result<u16> {
     if little_endian {
-        r.read_u16::<LittleEndian>().map_err(BioFormatsError::Io)
+        r.read_u16::<LittleEndian>().map_err(BioFormatsError::from)
     } else {
-        r.read_u16::<BigEndian>().map_err(BioFormatsError::Io)
+        r.read_u16::<BigEndian>().map_err(BioFormatsError::from)
     }
 }
 
 pub fn read_u32<R: Read>(r: &mut R, little_endian: bool) -> Result<u32> {
     if little_endian {
-        r.read_u32::<LittleEndian>().map_err(BioFormatsError::Io)
+        r.read_u32::<LittleEndian>().map_err(BioFormatsError::from)
     } else {
-        r.read_u32::<BigEndian>().map_err(BioFormatsError::Io)
+        r.read_u32::<BigEndian>().map_err(BioFormatsError::from)
     }
 }
 
 pub fn read_u64<R: Read>(r: &mut R, little_endian: bool) -> Result<u64> {
     if little_endian {
-        r.read_u64::<LittleEndian>().map_err(BioFormatsError::Io)
+        r.read_u64::<LittleEndian>().map_err(BioFormatsError::from)
     } else {
-        r.read_u64::<BigEndian>().map_err(BioFormatsError::Io)
+        r.read_u64::<BigEndian>().map_err(BioFormatsError::from)
     }
 }
 
 pub fn read_i16<R: Read>(r: &mut R, little_endian: bool) -> Result<i16> {
     if little_endian {
-        r.read_i16::<LittleEndian>().map_err(BioFormatsError::Io)
+        r.read_i16::<LittleEndian>().map_err(BioFormatsError::from)
     } else {
-        r.read_i16::<BigEndian>().map_err(BioFormatsError::Io)
+        r.read_i16::<BigEndian>().map_err(BioFormatsError::from)
     }
 }
 
 pub fn read_i32<R: Read>(r: &mut R, little_endian: bool) -> Result<i32> {
     if little_endian {
-        r.read_i32::<LittleEndian>().map_err(BioFormatsError::Io)
+        r.read_i32::<LittleEndian>().map_err(BioFormatsError::from)
     } else {
-        r.read_i32::<BigEndian>().map_err(BioFormatsError::Io)
+        r.read_i32::<BigEndian>().map_err(BioFormatsError::from)
     }
 }
 
 pub fn read_i64<R: Read>(r: &mut R, little_endian: bool) -> Result<i64> {
     if little_endian {
-        r.read_i64::<LittleEndian>().map_err(BioFormatsError::Io)
+        r.read_i64::<LittleEndian>().map_err(BioFormatsError::from)
     } else {
-        r.read_i64::<BigEndian>().map_err(BioFormatsError::Io)
+        r.read_i64::<BigEndian>().map_err(BioFormatsError::from)
     }
 }
 
 pub fn read_f32<R: Read>(r: &mut R, little_endian: bool) -> Result<f32> {
     if little_endian {
-        r.read_f32::<LittleEndian>().map_err(BioFormatsError::Io)
+        r.read_f32::<LittleEndian>().map_err(BioFormatsError::from)
     } else {
-        r.read_f32::<BigEndian>().map_err(BioFormatsError::Io)
+        r.read_f32::<BigEndian>().map_err(BioFormatsError::from)
     }
 }
 
 pub fn read_f64<R: Read>(r: &mut R, little_endian: bool) -> Result<f64> {
     if little_endian {
-        r.read_f64::<LittleEndian>().map_err(BioFormatsError::Io)
+        r.read_f64::<LittleEndian>().map_err(BioFormatsError::from)
     } else {
-        r.read_f64::<BigEndian>().map_err(BioFormatsError::Io)
+        r.read_f64::<BigEndian>().map_err(BioFormatsError::from)
     }
 }
 
