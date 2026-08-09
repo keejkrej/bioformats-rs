@@ -12,11 +12,11 @@ use crate::common::metadata::{
     ChannelMetadata, DimensionOrder, ImageMetadata, MetadataValue, PlaneMetadata,
 };
 use crate::common::pixel_type::PixelType;
-use crate::common::reader::FormatReader;
+use crate::common::reader::{validate_region, FormatReader};
 use crate::snapshot::ReaderSnapshot;
 
-use super::compression::decompress;
-use super::ifd::{tag, Compression, Ifd, Photometric};
+use super::compression::{decompress, DecompressionOptions};
+use super::ifd::{tag, Compression, Ifd, IfdValue, Photometric};
 use super::parser::TiffParser;
 
 #[derive(Debug, Clone)]
@@ -41,6 +41,88 @@ struct IfdInfo {
     color_map: Option<(Vec<u16>, Vec<u16>, Vec<u16>)>,
     jpeg_tables: Option<Vec<u8>>,
     image_description: Option<String>,
+}
+
+fn returned_samples_per_pixel(info: &IfdInfo) -> u32 {
+    u32::from(info.samples_per_pixel)
+}
+
+fn stored_samples_per_pixel(info: &IfdInfo) -> u32 {
+    if info.planar_config == 2 {
+        1
+    } else {
+        returned_samples_per_pixel(info)
+    }
+}
+
+fn stored_component_planes(info: &IfdInfo) -> u32 {
+    if info.planar_config == 2 {
+        returned_samples_per_pixel(info)
+    } else {
+        1
+    }
+}
+
+fn same_sample_layout(left: &IfdInfo, right: &IfdInfo) -> bool {
+    left.pixel_type == right.pixel_type
+        && left.bits_per_sample == right.bits_per_sample
+        && left.samples_per_pixel == right.samples_per_pixel
+        && left.planar_config == right.planar_config
+        && left.photometric == right.photometric
+}
+
+fn same_plane_layout(left: &IfdInfo, right: &IfdInfo) -> bool {
+    left.width == right.width
+        && left.height == right.height
+        && same_sample_layout(left, right)
+        && left.color_map == right.color_map
+}
+
+fn checked_byte_count(factors: &[u64]) -> Result<usize> {
+    let count = factors.iter().try_fold(1_u64, |count, factor| {
+        count
+            .checked_mul(*factor)
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)
+    })?;
+    let count = usize::try_from(count).map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+    if count > isize::MAX as usize {
+        return Err(BioFormatsError::PlaneByteCountOverflow);
+    }
+    Ok(count)
+}
+
+fn checked_index_mul(left: usize, right: usize, context: &str) -> Result<usize> {
+    left.checked_mul(right).ok_or_else(|| {
+        BioFormatsError::InvalidData(format!("TIFF {context} multiplication overflow"))
+    })
+}
+
+fn checked_index_add(left: usize, right: usize, context: &str) -> Result<usize> {
+    left.checked_add(right)
+        .ok_or_else(|| BioFormatsError::InvalidData(format!("TIFF {context} addition overflow")))
+}
+
+fn checked_storage_len(value: u64, context: &str) -> Result<usize> {
+    let value = usize::try_from(value).map_err(|_| {
+        BioFormatsError::InvalidData(format!("TIFF {context} does not fit in memory"))
+    })?;
+    if value > isize::MAX as usize {
+        return Err(BioFormatsError::InvalidData(format!(
+            "TIFF {context} does not fit in memory"
+        )));
+    }
+    Ok(value)
+}
+
+fn try_byte_buffer(capacity: usize, zeroed: bool) -> Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+    if zeroed {
+        buffer.resize(capacity, 0);
+    }
+    Ok(buffer)
 }
 
 #[derive(Debug)]
@@ -220,8 +302,7 @@ impl TiffReader {
         Ok(&series[root].resolutions[resolution].planes)
     }
 
-    fn generic_from_tiff(path: &Path) -> Result<BaseTiffReader> {
-        let minimal = MinimalTiffReader::from_paths(&[path.to_path_buf()])?;
+    fn generic_from_minimal(path: &Path, minimal: MinimalTiffReader) -> Result<BaseTiffReader> {
         let mut reader = BaseTiffReader {
             used_files: vec![path.to_path_buf()],
             series: Vec::new(),
@@ -300,9 +381,10 @@ impl FormatReader for TiffReader {
             || lower.ends_with(".tiff")
             || lower.ends_with(".ome.tif")
             || lower.ends_with(".ome.tiff")
+            || lower.ends_with(".tf2")
             || lower.ends_with(".tf8")
             || lower.ends_with(".btf")
-            || lower.ends_with(".companion.ome")
+            || lower.ends_with(".ome")
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
@@ -323,16 +405,15 @@ impl FormatReader for TiffReader {
             return Ok(());
         }
 
-        match Self::ome_from_path(path) {
-            Ok(reader) => {
-                self.backend = Some(TiffBackend::Ome(reader));
-                Ok(())
-            }
-            Err(_) => {
-                self.backend = Some(TiffBackend::Generic(Self::generic_from_tiff(path)?));
-                Ok(())
-            }
+        let minimal = MinimalTiffReader::from_paths(&[path.to_path_buf()])?;
+        if minimal.files.first().and_then(first_ome_xml).is_some() {
+            self.backend = Some(TiffBackend::Ome(Self::ome_from_path(path)?));
+        } else {
+            self.backend = Some(TiffBackend::Generic(Self::generic_from_minimal(
+                path, minimal,
+            )?));
         }
+        Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
@@ -392,6 +473,7 @@ impl FormatReader for TiffReader {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>> {
+        validate_region(self.active_metadata()?, x, y, w, h)?;
         let plane = self
             .active_planes()?
             .get(plane_index as usize)
@@ -627,12 +709,13 @@ impl TiffFileState {
         let sub_ifds = ifds
             .iter()
             .map(|ifd| {
-                ifd.get_vec_u64(tag::SUB_IFD)
+                checked_ifd_vec_u64(ifd, tag::SUB_IFD, "SubIFDs")?
+                    .unwrap_or_default()
                     .into_iter()
-                    .filter_map(|offset| parser.read_ifd(offset).ok().map(|value| value.0))
-                    .collect::<Vec<_>>()
+                    .map(|offset| parser.read_ifd(offset).map(|value| value.0))
+                    .collect::<Result<Vec<_>>>()
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             path: path.to_path_buf(),
             parser,
@@ -675,13 +758,29 @@ impl TiffFileState {
                 .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane.ifd_index as u32))?
         };
         let info = ifd_info(ifd, self.parser.little_endian)?;
-        let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
-        let effective_spp = if info.planar_config == 2 {
-            1
-        } else {
-            info.samples_per_pixel as u32
-        };
-        let plane_byte_len = (w * h * effective_spp * bytes_per_sample) as usize;
+        let bytes_per_sample = u64::from(info.bits_per_sample).div_ceil(8);
+        if bytes_per_sample == 0 || info.samples_per_pixel == 0 {
+            return Err(BioFormatsError::InvalidData(
+                "TIFF sample width and SamplesPerPixel must be non-zero".into(),
+            ));
+        }
+        let right = x.checked_add(w);
+        let bottom = y.checked_add(h);
+        if w == 0
+            || h == 0
+            || right.is_none_or(|right| right > info.width)
+            || bottom.is_none_or(|bottom| bottom > info.height)
+        {
+            return Err(BioFormatsError::InvalidData(
+                "TIFF read region is empty, overflows, or exceeds the IFD dimensions".into(),
+            ));
+        }
+        let plane_byte_len = checked_byte_count(&[
+            u64::from(w),
+            u64::from(h),
+            u64::from(returned_samples_per_pixel(&info)),
+            bytes_per_sample,
+        ])?;
         if info.is_tiled {
             self.read_tiled_plane(&info, x, y, w, h, plane_byte_len)
         } else {
@@ -696,66 +795,120 @@ impl TiffFileState {
         y: u32,
         w: u32,
         h: u32,
-        _plane_byte_len: usize,
+        plane_byte_len: usize,
     ) -> Result<Vec<u8>> {
-        let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
-        let effective_spp = if info.planar_config == 2 {
-            1u32
-        } else {
-            info.samples_per_pixel as u32
-        };
-        let row_bytes = info.width * effective_spp * bytes_per_sample;
+        let bytes_per_sample = u64::from(info.bits_per_sample).div_ceil(8);
+        let stored_spp = u64::from(stored_samples_per_pixel(info));
+        let component_planes = stored_component_planes(info);
+        let row_bytes = checked_byte_count(&[u64::from(info.width), stored_spp, bytes_per_sample])?;
+        let copy_bytes = checked_byte_count(&[u64::from(w), stored_spp, bytes_per_sample])?;
         let rows_per_strip = if info.rows_per_strip == 0 || info.rows_per_strip >= info.height {
             info.height
         } else {
             info.rows_per_strip
         };
+        let strips_per_component = info.height.div_ceil(rows_per_strip);
+        let region_bottom = y.checked_add(h).ok_or_else(|| {
+            BioFormatsError::InvalidData("TIFF region bottom overflows u32".into())
+        })?;
+        let x_start = checked_byte_count(&[u64::from(x), stored_spp, bytes_per_sample])?;
+        let mut out = try_byte_buffer(plane_byte_len, false)?;
 
-        let mut plane_rows = Vec::with_capacity((h * row_bytes) as usize);
-        for strip_index in 0..info.strip_offsets.len() {
-            let strip_start_row = strip_index as u32 * rows_per_strip;
-            let strip_end_row = (strip_start_row + rows_per_strip).min(info.height);
-            if strip_end_row <= y || strip_start_row >= y + h {
-                continue;
-            }
+        for component in 0..component_planes {
+            for strip in 0..strips_per_component {
+                let strip_start_row = strip.checked_mul(rows_per_strip).ok_or_else(|| {
+                    BioFormatsError::InvalidData("TIFF strip row index overflows u32".into())
+                })?;
+                let strip_end_row = strip_start_row
+                    .saturating_add(rows_per_strip)
+                    .min(info.height);
+                if strip_end_row <= y || strip_start_row >= region_bottom {
+                    continue;
+                }
 
-            let offset = info.strip_offsets[strip_index];
-            let byte_count = info.strip_byte_counts[strip_index] as usize;
-            let compressed = read_bytes_at(&mut self.parser.reader, offset, byte_count)?;
-            let strip_rows = strip_end_row - strip_start_row;
-            let expected = (strip_rows * row_bytes) as usize;
-            let mut strip_data = decompress(
-                &compressed,
-                info.compression,
-                expected,
-                info.predictor,
-                info.samples_per_pixel,
-                info.bits_per_sample,
-                info.jpeg_tables.as_deref(),
-            )?;
-            strip_data.truncate(expected);
-            let row_start = y.saturating_sub(strip_start_row) as usize;
-            let row_end = (y + h - strip_start_row).min(strip_rows) as usize;
-            for row in row_start..row_end {
-                let start = row * row_bytes as usize;
-                let end = start + row_bytes as usize;
-                if end <= strip_data.len() {
-                    plane_rows.extend_from_slice(&strip_data[start..end]);
+                let component_offset = checked_index_mul(
+                    component as usize,
+                    strips_per_component as usize,
+                    "strip component offset",
+                )?;
+                let strip_index =
+                    checked_index_add(component_offset, strip as usize, "strip index")?;
+                let offset = *info.strip_offsets.get(strip_index).ok_or_else(|| {
+                    BioFormatsError::InvalidData(format!(
+                        "TIFF strip offset {strip_index} is missing"
+                    ))
+                })?;
+                let byte_count = *info.strip_byte_counts.get(strip_index).ok_or_else(|| {
+                    BioFormatsError::InvalidData(format!(
+                        "TIFF strip byte count {strip_index} is missing"
+                    ))
+                })?;
+                let byte_count = checked_storage_len(byte_count, "strip byte count")?;
+                let strip_rows = strip_end_row - strip_start_row;
+                // A final strip may be encoded at the declared RowsPerStrip
+                // height even though only its in-image rows are copied.
+                let decode_limit = checked_byte_count(&[rows_per_strip.into(), row_bytes as u64])?;
+                let required = checked_byte_count(&[strip_rows.into(), row_bytes as u64])?;
+                if info.compression == Compression::None
+                    && !(required..=decode_limit).contains(&byte_count)
+                {
+                    return Err(BioFormatsError::InvalidData(format!(
+                        "uncompressed TIFF strip {strip_index} has {byte_count} bytes; expected between {required} and {decode_limit}"
+                    )));
+                }
+                let compressed = read_bytes_at(&mut self.parser.reader, offset, byte_count)?;
+                let strip_data = decompress(
+                    &compressed,
+                    info.compression,
+                    DecompressionOptions {
+                        expected_len: decode_limit,
+                        predictor: info.predictor,
+                        samples_per_pixel: stored_spp as u16,
+                        bits_per_sample: info.bits_per_sample,
+                        row_width: info.width,
+                        little_endian: self.parser.little_endian,
+                        jpeg_tables: info.jpeg_tables.as_deref(),
+                    },
+                )?;
+                if strip_data.len() < required {
+                    return Err(BioFormatsError::InvalidData(format!(
+                        "TIFF strip {strip_index} decoded to {} bytes; expected at least {required}",
+                        strip_data.len()
+                    )));
+                }
+
+                let first_row = y.max(strip_start_row);
+                let last_row = region_bottom.min(strip_end_row);
+                for source_y in first_row..last_row {
+                    let row = (source_y - strip_start_row) as usize;
+                    let start = checked_index_add(
+                        checked_index_mul(row, row_bytes, "strip row offset")?,
+                        x_start,
+                        "strip column offset",
+                    )?;
+                    let end = checked_index_add(start, copy_bytes, "strip row end")?;
+                    if end > strip_data.len() {
+                        return Err(BioFormatsError::InvalidData(format!(
+                            "TIFF strip {strip_index} region exceeds decoded data"
+                        )));
+                    }
+                    let output_end =
+                        checked_index_add(out.len(), copy_bytes, "strip output position")?;
+                    if output_end > plane_byte_len {
+                        return Err(BioFormatsError::InvalidData(
+                            "TIFF strips exceed the expected plane byte count".into(),
+                        ));
+                    }
+                    out.extend_from_slice(&strip_data[start..end]);
                 }
             }
         }
 
-        if x == 0 && w == info.width {
-            return Ok(plane_rows);
-        }
-
-        let x_start = (x * effective_spp * bytes_per_sample) as usize;
-        let x_len = (w * effective_spp * bytes_per_sample) as usize;
-        let full_row = row_bytes as usize;
-        let mut out = Vec::with_capacity(h as usize * x_len);
-        for row in 0..h as usize {
-            let src = &plane_rows[row * full_row..];
-            out.extend_from_slice(&src[x_start..x_start + x_len]);
+        if out.len() != plane_byte_len {
+            return Err(BioFormatsError::InvalidData(format!(
+                "TIFF strips produced {} bytes; expected {plane_byte_len}",
+                out.len()
+            )));
         }
         Ok(out)
     }
@@ -767,62 +920,179 @@ impl TiffFileState {
         y: u32,
         w: u32,
         h: u32,
-        _plane_byte_len: usize,
+        plane_byte_len: usize,
     ) -> Result<Vec<u8>> {
-        let bytes_per_sample = (info.bits_per_sample as u32 + 7) / 8;
-        let effective_spp = if info.planar_config == 2 {
-            1u32
-        } else {
-            info.samples_per_pixel as u32
-        };
-        let tile_row_bytes = (info.tile_width * effective_spp * bytes_per_sample) as usize;
-        let tile_data_bytes = tile_row_bytes * info.tile_height as usize;
-        let tiles_across = (info.width + info.tile_width - 1) / info.tile_width;
+        let bytes_per_sample = u64::from(info.bits_per_sample).div_ceil(8);
+        let stored_spp = u64::from(stored_samples_per_pixel(info));
+        let component_planes = stored_component_planes(info);
+        if info.tile_width == 0 || info.tile_height == 0 {
+            return Err(BioFormatsError::InvalidData(
+                "TIFF tiled image has a zero tile dimension".into(),
+            ));
+        }
+        let tile_row_bytes =
+            checked_byte_count(&[u64::from(info.tile_width), stored_spp, bytes_per_sample])?;
+        let tile_data_bytes =
+            checked_byte_count(&[u64::from(info.tile_height), tile_row_bytes as u64])?;
+        let tiles_across = info.width.div_ceil(info.tile_width);
+        let tiles_down = info.height.div_ceil(info.tile_height);
+        let tiles_per_component = checked_index_mul(
+            tiles_across as usize,
+            tiles_down as usize,
+            "tiles per component",
+        )?;
         let tx_start = x / info.tile_width;
-        let tx_end = (x + w + info.tile_width - 1) / info.tile_width;
+        let region_right = x.checked_add(w).ok_or_else(|| {
+            BioFormatsError::InvalidData("TIFF region right edge overflows u32".into())
+        })?;
+        let tx_end = region_right.div_ceil(info.tile_width);
         let ty_start = y / info.tile_height;
-        let ty_end = (y + h + info.tile_height - 1) / info.tile_height;
-        let out_row_bytes = (w * effective_spp * bytes_per_sample) as usize;
-        let mut out = vec![0u8; h as usize * out_row_bytes];
+        let region_bottom = y.checked_add(h).ok_or_else(|| {
+            BioFormatsError::InvalidData("TIFF region bottom edge overflows u32".into())
+        })?;
+        let ty_end = region_bottom.div_ceil(info.tile_height);
+        let out_row_bytes = checked_byte_count(&[u64::from(w), stored_spp, bytes_per_sample])?;
+        let out_component_bytes = checked_byte_count(&[u64::from(h), out_row_bytes as u64])?;
+        let computed_plane_bytes =
+            checked_byte_count(&[u64::from(component_planes), out_component_bytes as u64])?;
+        if computed_plane_bytes != plane_byte_len {
+            return Err(BioFormatsError::InvalidData(
+                "TIFF tiled plane layout does not match its byte count".into(),
+            ));
+        }
+        let mut out = try_byte_buffer(plane_byte_len, true)?;
 
-        for ty in ty_start..ty_end {
-            for tx in tx_start..tx_end {
-                let tile_index = (ty * tiles_across + tx) as usize;
-                if tile_index >= info.tile_offsets.len() {
-                    continue;
-                }
-                let offset = info.tile_offsets[tile_index];
-                let byte_count = info.tile_byte_counts[tile_index] as usize;
-                let compressed = read_bytes_at(&mut self.parser.reader, offset, byte_count)?;
-                let mut tile_data = decompress(
-                    &compressed,
-                    info.compression,
-                    tile_data_bytes,
-                    info.predictor,
-                    info.samples_per_pixel,
-                    info.bits_per_sample,
-                    info.jpeg_tables.as_deref(),
-                )?;
-                tile_data.resize(tile_data_bytes, 0);
+        for component in 0..component_planes {
+            for ty in ty_start..ty_end {
+                for tx in tx_start..tx_end {
+                    let component_offset = checked_index_mul(
+                        component as usize,
+                        tiles_per_component,
+                        "tile component offset",
+                    )?;
+                    let tile_row_offset =
+                        checked_index_mul(ty as usize, tiles_across as usize, "tile row offset")?;
+                    let tile_in_component =
+                        checked_index_add(tile_row_offset, tx as usize, "tile column offset")?;
+                    let tile_index =
+                        checked_index_add(component_offset, tile_in_component, "tile index")?;
+                    let offset = *info.tile_offsets.get(tile_index).ok_or_else(|| {
+                        BioFormatsError::InvalidData(format!(
+                            "TIFF tile offset {tile_index} is missing"
+                        ))
+                    })?;
+                    let byte_count = *info.tile_byte_counts.get(tile_index).ok_or_else(|| {
+                        BioFormatsError::InvalidData(format!(
+                            "TIFF tile byte count {tile_index} is missing"
+                        ))
+                    })?;
+                    let byte_count = checked_storage_len(byte_count, "tile byte count")?;
+                    if info.compression == Compression::None && byte_count > tile_data_bytes {
+                        return Err(BioFormatsError::InvalidData(format!(
+                            "uncompressed TIFF tile {tile_index} has {byte_count} bytes; maximum is {tile_data_bytes}"
+                        )));
+                    }
+                    let compressed = read_bytes_at(&mut self.parser.reader, offset, byte_count)?;
+                    let tile_data = decompress(
+                        &compressed,
+                        info.compression,
+                        DecompressionOptions {
+                            expected_len: tile_data_bytes,
+                            predictor: info.predictor,
+                            samples_per_pixel: stored_spp as u16,
+                            bits_per_sample: info.bits_per_sample,
+                            row_width: info.tile_width,
+                            little_endian: self.parser.little_endian,
+                            jpeg_tables: info.jpeg_tables.as_deref(),
+                        },
+                    )?;
+                    let tile_x0 = tx.checked_mul(info.tile_width).ok_or_else(|| {
+                        BioFormatsError::InvalidData("TIFF tile X offset overflows u32".into())
+                    })?;
+                    let tile_y0 = ty.checked_mul(info.tile_height).ok_or_else(|| {
+                        BioFormatsError::InvalidData("TIFF tile Y offset overflows u32".into())
+                    })?;
+                    let stored_width = info.width.saturating_sub(tile_x0).min(info.tile_width);
+                    let stored_height = info.height.saturating_sub(tile_y0).min(info.tile_height);
+                    let stored_row_bytes = checked_byte_count(&[
+                        u64::from(stored_width),
+                        stored_spp,
+                        bytes_per_sample,
+                    ])?;
+                    let required_tile_bytes = if stored_height == 0 {
+                        0
+                    } else {
+                        checked_index_add(
+                            checked_index_mul(
+                                stored_height.saturating_sub(1) as usize,
+                                tile_row_bytes,
+                                "TIFF stored tile row offset",
+                            )?,
+                            stored_row_bytes,
+                            "TIFF stored tile end",
+                        )?
+                    };
+                    if tile_data.len() < required_tile_bytes {
+                        return Err(BioFormatsError::InvalidData(format!(
+                            "TIFF tile {tile_index} decoded to {} bytes; at least {required_tile_bytes} bytes are required for its in-image pixels",
+                            tile_data.len()
+                        )));
+                    }
+                    let copy_x0 = x.max(tile_x0);
+                    let copy_y0 = y.max(tile_y0);
+                    let copy_x1 = region_right
+                        .min(tile_x0.saturating_add(info.tile_width))
+                        .min(info.width);
+                    let copy_y1 = region_bottom
+                        .min(tile_y0.saturating_add(info.tile_height))
+                        .min(info.height);
+                    let src_x = (copy_x0 - tile_x0) as usize;
+                    let src_y = (copy_y0 - tile_y0) as usize;
+                    let dst_x = (copy_x0 - x) as usize;
+                    let dst_y = (copy_y0 - y) as usize;
+                    let copy_w = (copy_x1 - copy_x0) as usize;
+                    let copy_h = (copy_y1 - copy_y0) as usize;
+                    let copy_bytes =
+                        checked_byte_count(&[copy_w as u64, stored_spp, bytes_per_sample])?;
+                    for row in 0..copy_h {
+                        let src_row = checked_index_add(src_y, row, "tile source row")?;
+                        let src_row_offset =
+                            checked_index_mul(src_row, tile_row_bytes, "tile source row offset")?;
+                        let src_column_offset =
+                            checked_byte_count(&[src_x as u64, stored_spp, bytes_per_sample])?;
+                        let src_off = checked_index_add(
+                            src_row_offset,
+                            src_column_offset,
+                            "tile source offset",
+                        )?;
 
-                let tile_x0 = tx * info.tile_width;
-                let tile_y0 = ty * info.tile_height;
-                let src_x = x.saturating_sub(tile_x0) as usize;
-                let src_y = y.saturating_sub(tile_y0) as usize;
-                let dst_x = tile_x0.saturating_sub(x) as usize;
-                let dst_y = tile_y0.saturating_sub(y) as usize;
-                let copy_w = ((info.tile_width - src_x as u32).min(w - dst_x as u32)) as usize;
-                let copy_h = ((info.tile_height - src_y as u32).min(h - dst_y as u32)) as usize;
-                let copy_bytes = copy_w * effective_spp as usize * bytes_per_sample as usize;
-                for row in 0..copy_h {
-                    let src_off = ((src_y + row) * tile_row_bytes)
-                        + src_x * effective_spp as usize * bytes_per_sample as usize;
-                    let dst_off = ((dst_y + row) * out_row_bytes)
-                        + dst_x * effective_spp as usize * bytes_per_sample as usize;
-                    if src_off + copy_bytes <= tile_data.len() && dst_off + copy_bytes <= out.len()
-                    {
-                        out[dst_off..dst_off + copy_bytes]
-                            .copy_from_slice(&tile_data[src_off..src_off + copy_bytes]);
+                        let component_offset = checked_index_mul(
+                            component as usize,
+                            out_component_bytes,
+                            "tile output component offset",
+                        )?;
+                        let dst_row = checked_index_add(dst_y, row, "tile output row")?;
+                        let dst_row_offset =
+                            checked_index_mul(dst_row, out_row_bytes, "tile output row offset")?;
+                        let dst_column_offset =
+                            checked_byte_count(&[dst_x as u64, stored_spp, bytes_per_sample])?;
+                        let dst_off = checked_index_add(
+                            checked_index_add(
+                                component_offset,
+                                dst_row_offset,
+                                "tile output row position",
+                            )?,
+                            dst_column_offset,
+                            "tile output column position",
+                        )?;
+                        let src_end = checked_index_add(src_off, copy_bytes, "tile source end")?;
+                        let dst_end = checked_index_add(dst_off, copy_bytes, "tile output end")?;
+                        if src_end > tile_data.len() || dst_end > out.len() {
+                            return Err(BioFormatsError::InvalidData(format!(
+                                "TIFF tile {tile_index} copy exceeds decoded or output data"
+                            )));
+                        }
+                        out[dst_off..dst_end].copy_from_slice(&tile_data[src_off..src_end]);
                     }
                 }
             }
@@ -832,27 +1102,157 @@ impl TiffFileState {
     }
 }
 
+fn checked_ifd_u32(ifd: &Ifd, tag_id: u16, name: &str) -> Result<Option<u32>> {
+    let Some(value) = ifd.get(tag_id) else {
+        return Ok(None);
+    };
+    let value = value.as_u64().ok_or_else(|| {
+        BioFormatsError::InvalidData(format!("TIFF {name} is not an unsigned integer"))
+    })?;
+    Ok(Some(u32::try_from(value).map_err(|_| {
+        BioFormatsError::InvalidData(format!("TIFF {name} value {value} exceeds u32"))
+    })?))
+}
+
+fn checked_ifd_u16(ifd: &Ifd, tag_id: u16, name: &str) -> Result<Option<u16>> {
+    let Some(value) = ifd.get(tag_id) else {
+        return Ok(None);
+    };
+    let value = value.as_u64().ok_or_else(|| {
+        BioFormatsError::InvalidData(format!("TIFF {name} is not an unsigned integer"))
+    })?;
+    Ok(Some(u16::try_from(value).map_err(|_| {
+        BioFormatsError::InvalidData(format!("TIFF {name} value {value} exceeds u16"))
+    })?))
+}
+
+fn checked_ifd_vec_u64(ifd: &Ifd, tag_id: u16, name: &str) -> Result<Option<Vec<u64>>> {
+    let Some(value) = ifd.get(tag_id) else {
+        return Ok(None);
+    };
+    let length = match value {
+        IfdValue::Byte(values) => values.len(),
+        IfdValue::Short(values) => values.len(),
+        IfdValue::Long(values) | IfdValue::IFD(values) => values.len(),
+        IfdValue::Long8(values) | IfdValue::IFD8(values) => values.len(),
+        _ => {
+            return Err(BioFormatsError::InvalidData(format!(
+                "TIFF {name} is not an unsigned integer array"
+            )))
+        }
+    };
+    if length == 0 {
+        return Err(BioFormatsError::InvalidData(format!(
+            "TIFF {name} is present but empty"
+        )));
+    }
+    let mut values = Vec::new();
+    values.try_reserve_exact(length).map_err(|error| {
+        BioFormatsError::InvalidData(format!("cannot allocate TIFF {name} values: {error}"))
+    })?;
+    match value {
+        IfdValue::Byte(items) => values.extend(items.iter().copied().map(u64::from)),
+        IfdValue::Short(items) => values.extend(items.iter().copied().map(u64::from)),
+        IfdValue::Long(items) | IfdValue::IFD(items) => {
+            values.extend(items.iter().copied().map(u64::from));
+        }
+        IfdValue::Long8(items) | IfdValue::IFD8(items) => values.extend_from_slice(items),
+        _ => unreachable!("validated unsigned TIFF array type"),
+    }
+    Ok(Some(values))
+}
+
+fn checked_ifd_vec_u16(ifd: &Ifd, tag_id: u16, name: &str) -> Result<Option<Vec<u16>>> {
+    let Some(raw) = checked_ifd_vec_u64(ifd, tag_id, name)? else {
+        return Ok(None);
+    };
+    let mut values = Vec::new();
+    values.try_reserve_exact(raw.len()).map_err(|error| {
+        BioFormatsError::InvalidData(format!("cannot allocate TIFF {name} values: {error}"))
+    })?;
+    for item in raw {
+        values.push(u16::try_from(item).map_err(|_| {
+            BioFormatsError::InvalidData(format!("TIFF {name} value {item} exceeds u16"))
+        })?);
+    }
+    Ok(Some(values))
+}
+
 fn ifd_info(ifd: &Ifd, _little_endian: bool) -> Result<IfdInfo> {
-    let width = ifd
-        .image_width()
+    let width = checked_ifd_u32(ifd, tag::IMAGE_WIDTH, "ImageWidth")?
         .ok_or_else(|| BioFormatsError::Format("IFD missing ImageWidth".into()))?;
-    let height = ifd
-        .image_length()
+    let height = checked_ifd_u32(ifd, tag::IMAGE_LENGTH, "ImageLength")?
         .ok_or_else(|| BioFormatsError::Format("IFD missing ImageLength".into()))?;
-    let samples_per_pixel = ifd.samples_per_pixel();
-    let bps_vec = ifd.bits_per_sample();
+    let samples_per_pixel =
+        checked_ifd_u16(ifd, tag::SAMPLES_PER_PIXEL, "SamplesPerPixel")?.unwrap_or(1);
+    if samples_per_pixel == 0 {
+        return Err(BioFormatsError::Format(
+            "TIFF SamplesPerPixel must be positive".into(),
+        ));
+    }
+    let bps_vec =
+        checked_ifd_vec_u16(ifd, tag::BITS_PER_SAMPLE, "BitsPerSample")?.unwrap_or_else(|| vec![1]);
     let bits_per_sample = bps_vec.first().copied().unwrap_or(8);
-    let sample_format = ifd.get_u16(tag::SAMPLE_FORMAT).unwrap_or(1);
-    let pixel_type = pixel_type_from_bps_format(bits_per_sample, sample_format);
-    let photometric = ifd.photometric();
-    let compression = ifd.compression();
-    let planar_config = ifd.planar_configuration();
-    let predictor = ifd.predictor();
+    if bps_vec.iter().any(|bits| *bits != bits_per_sample)
+        || (bps_vec.len() > 1 && bps_vec.len() != samples_per_pixel as usize)
+    {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TIFF: mixed or inconsistent BitsPerSample values are not yet supported".into(),
+        ));
+    }
+    let sample_formats =
+        checked_ifd_vec_u16(ifd, tag::SAMPLE_FORMAT, "SampleFormat")?.unwrap_or_default();
+    let sample_format = sample_formats.first().copied().unwrap_or(1);
+    if sample_formats.iter().any(|format| *format != sample_format)
+        || (sample_formats.len() > 1 && sample_formats.len() != samples_per_pixel as usize)
+    {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TIFF: mixed or inconsistent SampleFormat values are not yet supported".into(),
+        ));
+    }
+    let pixel_type = pixel_type_from_bps_format(bits_per_sample, sample_format)?;
+    let photometric = Photometric::from(
+        checked_ifd_u16(
+            ifd,
+            tag::PHOTOMETRIC_INTERPRETATION,
+            "PhotometricInterpretation",
+        )?
+        .unwrap_or(1),
+    );
+    let compression =
+        Compression::from(checked_ifd_u16(ifd, tag::COMPRESSION, "Compression")?.unwrap_or(1));
+    let planar_config =
+        checked_ifd_u16(ifd, tag::PLANAR_CONFIGURATION, "PlanarConfiguration")?.unwrap_or(1);
+    if !matches!(planar_config, 1 | 2) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "TIFF: unsupported PlanarConfiguration {planar_config}"
+        )));
+    }
+    let predictor = checked_ifd_u16(ifd, tag::PREDICTOR, "Predictor")?.unwrap_or(1);
+    if predictor != 1 && !(predictor == 2 && matches!(bits_per_sample, 8 | 16)) {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "TIFF: Predictor {predictor} with {bits_per_sample}-bit samples is not yet supported"
+        )));
+    }
+    if checked_ifd_u16(ifd, tag::FILL_ORDER, "FillOrder")?.unwrap_or(1) != 1 {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "TIFF: FillOrder 2 is not yet supported".into(),
+        ));
+    }
+    match photometric {
+        Photometric::MinIsBlack | Photometric::Rgb | Photometric::Palette => {}
+        Photometric::YCbCr if matches!(compression, Compression::Jpeg | Compression::JpegNew) => {}
+        other => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TIFF: photometric interpretation {other:?} is not yet normalized"
+            )))
+        }
+    }
     let is_tiled = ifd.is_tiled();
     let (tile_width, tile_height) = if is_tiled {
         (
-            ifd.tile_width().unwrap_or(0),
-            ifd.tile_length().unwrap_or(0),
+            checked_ifd_u32(ifd, tag::TILE_WIDTH, "TileWidth")?.unwrap_or(0),
+            checked_ifd_u32(ifd, tag::TILE_LENGTH, "TileLength")?.unwrap_or(0),
         )
     } else {
         (0, 0)
@@ -860,15 +1260,30 @@ fn ifd_info(ifd: &Ifd, _little_endian: bool) -> Result<IfdInfo> {
     let rows_per_strip = if is_tiled {
         0
     } else {
-        ifd.get_u32(tag::ROWS_PER_STRIP).unwrap_or(height)
+        checked_ifd_u32(ifd, tag::ROWS_PER_STRIP, "RowsPerStrip")?.unwrap_or(height)
     };
-    let strip_offsets = ifd.get_vec_u64(tag::STRIP_OFFSETS);
-    let strip_byte_counts = ifd.get_vec_u64(tag::STRIP_BYTE_COUNTS);
-    let tile_offsets = ifd.get_vec_u64(tag::TILE_OFFSETS);
-    let tile_byte_counts = ifd.get_vec_u64(tag::TILE_BYTE_COUNTS);
+    let strip_offsets =
+        checked_ifd_vec_u64(ifd, tag::STRIP_OFFSETS, "StripOffsets")?.unwrap_or_default();
+    let strip_byte_counts =
+        checked_ifd_vec_u64(ifd, tag::STRIP_BYTE_COUNTS, "StripByteCounts")?.unwrap_or_default();
+    let tile_offsets =
+        checked_ifd_vec_u64(ifd, tag::TILE_OFFSETS, "TileOffsets")?.unwrap_or_default();
+    let tile_byte_counts =
+        checked_ifd_vec_u64(ifd, tag::TILE_BYTE_COUNTS, "TileByteCounts")?.unwrap_or_default();
     let color_map = if photometric == Photometric::Palette {
-        if let Some(value) = ifd.get(tag::COLOR_MAP) {
-            let data = value.as_vec_u16();
+        if let Some(data) = checked_ifd_vec_u16(ifd, tag::COLOR_MAP, "ColorMap")? {
+            let expected_color_map_length = 1_usize
+                .checked_shl(u32::from(bits_per_sample))
+                .and_then(|entries| entries.checked_mul(3))
+                .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+            if data.len() != expected_color_map_length {
+                return Err(BioFormatsError::InvalidData(
+                    format!(
+                        "TIFF ColorMap has {} entries; expected {expected_color_map_length} for {bits_per_sample}-bit indices",
+                        data.len()
+                    ),
+                ));
+            }
             let third = data.len() / 3;
             Some((
                 data[..third].to_vec(),
@@ -911,19 +1326,23 @@ fn ifd_info(ifd: &Ifd, _little_endian: bool) -> Result<IfdInfo> {
     })
 }
 
-fn pixel_type_from_bps_format(bps: u16, sample_format: u16) -> PixelType {
-    match (bps, sample_format) {
-        (1, _) => PixelType::Bit,
+fn pixel_type_from_bps_format(bps: u16, sample_format: u16) -> Result<PixelType> {
+    let pixel_type = match (bps, sample_format) {
         (8, 2) => PixelType::Int8,
-        (8, _) => PixelType::Uint8,
+        (8, 1 | 4) => PixelType::Uint8,
         (16, 2) => PixelType::Int16,
-        (16, _) => PixelType::Uint16,
+        (16, 1 | 4) => PixelType::Uint16,
         (32, 2) => PixelType::Int32,
         (32, 3) => PixelType::Float32,
-        (32, _) => PixelType::Uint32,
+        (32, 1 | 4) => PixelType::Uint32,
         (64, 3) => PixelType::Float64,
-        _ => PixelType::Uint8,
-    }
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TIFF: {bps}-bit samples with SampleFormat {sample_format} are not yet supported"
+            )))
+        }
+    };
+    Ok(pixel_type)
 }
 
 fn first_ome_xml(file: &TiffFileState) -> Option<String> {
@@ -960,8 +1379,8 @@ fn build_generic_series(
         .ifds
         .iter()
         .enumerate()
-        .filter_map(|(index, ifd)| ifd_info(ifd, little_endian).ok().map(|info| (index, info)))
-        .collect::<Vec<_>>();
+        .map(|(index, ifd)| ifd_info(ifd, little_endian).map(|info| (index, info)))
+        .collect::<Result<Vec<_>>>()?;
     if infos.is_empty() {
         return Ok(Vec::new());
     }
@@ -970,11 +1389,7 @@ fn build_generic_series(
     for (index, info) in infos {
         if let Some(last) = groups.last_mut() {
             let previous = &last.last().unwrap().1;
-            if previous.width == info.width
-                && previous.height == info.height
-                && previous.samples_per_pixel == info.samples_per_pixel
-                && previous.bits_per_sample == info.bits_per_sample
-            {
+            if same_plane_layout(previous, &info) {
                 last.push((index, info));
                 continue;
             }
@@ -1001,7 +1416,7 @@ fn build_generic_series(
                 &file.ifds[group[0].0],
                 first,
                 little_endian,
-            );
+            )?;
             let resolutions = build_resolution_levels(minimal, plane_refs, metadata.clone())?;
             metadata = resolutions[0].metadata.clone();
             Ok(SeriesData {
@@ -1032,6 +1447,7 @@ fn generic_metadata_from_info(
         size_t: 1,
         pixel_type: info.pixel_type,
         bits_per_pixel: info.bits_per_sample as u8,
+        samples_per_pixel: returned_samples_per_pixel(info),
         image_count,
         dimension_order: DimensionOrder::XYZTC,
         is_rgb,
@@ -1065,7 +1481,7 @@ fn apply_standard_tiff_metadata(
     ifd: &Ifd,
     info: &IfdInfo,
     little_endian: bool,
-) {
+) -> Result<()> {
     if let Some(software) = ifd.get_str(tag::SOFTWARE) {
         metadata.series_metadata.insert(
             "Software".into(),
@@ -1079,12 +1495,23 @@ fn apply_standard_tiff_metadata(
             MetadataValue::String(datetime.to_string()),
         );
     }
+    let resolution_unit =
+        checked_ifd_u16(ifd, tag::RESOLUTION_UNIT, "ResolutionUnit")?.unwrap_or(1);
+    let resolution_multiplier_um = match resolution_unit {
+        2 => 25_400.0,
+        3 => 10_000.0,
+        _ => 1.0,
+    };
+    metadata.series_metadata.insert(
+        "ResolutionUnit".into(),
+        MetadataValue::Int(i64::from(resolution_unit)),
+    );
     if let Some(resolution) = rational_to_f64(ifd.get(tag::X_RESOLUTION)) {
         metadata
             .series_metadata
             .insert("XResolution".into(), MetadataValue::Float(resolution));
         if resolution > 0.0 {
-            metadata.physical_size_x_um = Some(10_000.0 / resolution);
+            metadata.physical_size_x_um = Some(resolution_multiplier_um / resolution);
         }
     }
     if let Some(resolution) = rational_to_f64(ifd.get(tag::Y_RESOLUTION)) {
@@ -1092,7 +1519,7 @@ fn apply_standard_tiff_metadata(
             .series_metadata
             .insert("YResolution".into(), MetadataValue::Float(resolution));
         if resolution > 0.0 {
-            metadata.physical_size_y_um = Some(10_000.0 / resolution);
+            metadata.physical_size_y_um = Some(resolution_multiplier_um / resolution);
         }
     }
     metadata.is_little_endian = little_endian;
@@ -1104,6 +1531,7 @@ fn apply_standard_tiff_metadata(
                 green: green.clone(),
                 blue: blue.clone(),
             });
+    Ok(())
 }
 
 fn rational_to_f64(value: Option<&super::ifd::IfdValue>) -> Option<f64> {
@@ -1130,6 +1558,15 @@ fn build_resolution_levels(
         .map(|plane| minimal.files[plane.file_index].sub_ifds[plane.ifd_index].len())
         .min()
         .unwrap_or(0);
+    let root_sample_plane = root_planes
+        .first()
+        .ok_or_else(|| BioFormatsError::Format("TIFF series contains no root planes".into()))?;
+    let root_sample_file = &minimal.files[root_sample_plane.file_index];
+    let root_sample_ifd = root_sample_file
+        .ifds
+        .get(root_sample_plane.ifd_index)
+        .ok_or_else(|| BioFormatsError::Format("missing TIFF root IFD".into()))?;
+    let root_info = ifd_info(root_sample_ifd, root_sample_file.parser.little_endian)?;
 
     for level in 0..sub_count {
         let sample_ifd = minimal.files[root_planes[0].file_index].sub_ifds
@@ -1142,10 +1579,46 @@ fn build_resolution_levels(
                 .parser
                 .little_endian,
         )?;
+        let sample_little_endian = minimal.files[root_planes[0].file_index]
+            .parser
+            .little_endian;
+        if !same_sample_layout(&root_info, &info)
+            || sample_little_endian != root_sample_file.parser.little_endian
+        {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TIFF SubIFD resolution {} changes the root pixel layout",
+                level + 1
+            )));
+        }
+        for (plane_index, plane) in root_planes.iter().enumerate() {
+            let file = minimal.files.get(plane.file_index).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "TIFF pyramid plane {plane_index} references a missing file"
+                ))
+            })?;
+            let sub_ifd = file
+                .sub_ifds
+                .get(plane.ifd_index)
+                .and_then(|levels| levels.get(level))
+                .ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "TIFF pyramid plane {plane_index} is missing SubIFD level {}",
+                        level + 1
+                    ))
+                })?;
+            let plane_info = ifd_info(sub_ifd, file.parser.little_endian)?;
+            if !same_plane_layout(&info, &plane_info)
+                || file.parser.little_endian != sample_little_endian
+            {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "TIFF pyramid plane {plane_index} has a different layout at resolution {}",
+                    level + 1
+                )));
+            }
+        }
         let mut metadata = root_metadata.clone();
         metadata.size_x = info.width;
         metadata.size_y = info.height;
-        metadata.bits_per_pixel = info.bits_per_sample as u8;
         metadata.lookup_table = info.color_map.as_ref().map(|(red, green, blue)| {
             crate::common::metadata::LookupTable {
                 red: red.clone(),
@@ -1183,11 +1656,13 @@ struct OmeImage {
     size_x: u32,
     size_y: u32,
     size_z: u32,
-    size_c_logical: u32,
+    size_c_samples: u32,
     size_t: u32,
     pixel_type: PixelType,
+    significant_bits: u8,
     dimension_order: DimensionOrder,
     channels: Vec<ChannelMetadata>,
+    channel_samples_per_pixel: Vec<u32>,
     planes: Vec<PlaneMetadata>,
     tiff_data: Vec<OmeTiffData>,
     physical_size_x_um: Option<f64>,
@@ -1203,11 +1678,11 @@ struct OmeImage {
 #[derive(Debug, Clone)]
 struct OmeTiffData {
     file: PathBuf,
-    ifd: usize,
+    ifd: Option<usize>,
     first_z: u32,
     first_c: u32,
     first_t: u32,
-    plane_count: u32,
+    plane_count: Option<u32>,
 }
 
 fn parse_ome_dataset(
@@ -1250,81 +1725,109 @@ fn parse_ome_dataset(
             .children()
             .find(|node| node.has_tag_name("Pixels"))
             .ok_or_else(|| BioFormatsError::Format("OME Image missing Pixels".into()))?;
-        let size_x = pixels
-            .attribute("SizeX")
-            .and_then(parse_u32)
-            .ok_or_else(|| BioFormatsError::Format("OME Pixels missing SizeX".into()))?;
-        let size_y = pixels
-            .attribute("SizeY")
-            .and_then(parse_u32)
-            .ok_or_else(|| BioFormatsError::Format("OME Pixels missing SizeY".into()))?;
-        let size_z = pixels.attribute("SizeZ").and_then(parse_u32).unwrap_or(1);
-        let size_c_logical = pixels.attribute("SizeC").and_then(parse_u32).unwrap_or(1);
-        let size_t = pixels.attribute("SizeT").and_then(parse_u32).unwrap_or(1);
-        let pixel_type = pixels
+        let size_x = positive_u32_attribute(pixels, "SizeX", None)?;
+        let size_y = positive_u32_attribute(pixels, "SizeY", None)?;
+        let size_z = positive_u32_attribute(pixels, "SizeZ", Some(1))?;
+        let size_c_samples = positive_u32_attribute(pixels, "SizeC", Some(1))?;
+        let size_t = positive_u32_attribute(pixels, "SizeT", Some(1))?;
+        let raw_pixel_type = pixels
             .attribute("Type")
-            .and_then(pixel_type_from_ome)
-            .unwrap_or(PixelType::Uint8);
-        let dimension_order = pixels
+            .ok_or_else(|| BioFormatsError::Format("OME Pixels missing Type".into()))?;
+        let pixel_type = pixel_type_from_ome(raw_pixel_type).ok_or_else(|| {
+            BioFormatsError::UnsupportedFormat(format!(
+                "OME pixel type {raw_pixel_type} is not supported"
+            ))
+        })?;
+        let storage_bits = u32::try_from(pixel_type.bytes_per_sample())
+            .ok()
+            .and_then(|bytes| bytes.checked_mul(8))
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        let significant_bits =
+            positive_u32_attribute(pixels, "SignificantBits", Some(storage_bits))?;
+        if significant_bits > storage_bits {
+            return Err(BioFormatsError::Format(format!(
+                "OME SignificantBits {significant_bits} exceeds {storage_bits}-bit {raw_pixel_type} storage"
+            )));
+        }
+        let significant_bits = u8::try_from(significant_bits).map_err(|_| {
+            BioFormatsError::Format("OME SignificantBits does not fit in u8".into())
+        })?;
+        let raw_dimension_order = pixels
             .attribute("DimensionOrder")
-            .and_then(DimensionOrder::from_str)
-            .unwrap_or(DimensionOrder::XYCZT);
+            .ok_or_else(|| BioFormatsError::Format("OME Pixels missing DimensionOrder".into()))?;
+        let dimension_order = DimensionOrder::from_str(raw_dimension_order).ok_or_else(|| {
+            BioFormatsError::Format(format!(
+                "OME DimensionOrder {raw_dimension_order} is invalid"
+            ))
+        })?;
 
-        let channels = pixels
+        let mut channels = Vec::new();
+        let mut channel_samples_per_pixel = Vec::new();
+        for node in pixels
             .children()
             .filter(|node| node.has_tag_name("Channel"))
-            .map(|node| ChannelMetadata {
+        {
+            channel_samples_per_pixel.push(positive_u32_attribute(
+                node,
+                "SamplesPerPixel",
+                Some(1),
+            )?);
+            channels.push(ChannelMetadata {
                 name: node.attribute("Name").map(str::to_owned),
                 color: node
                     .attribute("Color")
                     .and_then(parse_i32)
                     .map(|value| value as u32),
-                emission_wavelength_nm: node.attribute("EmissionWavelength").and_then(parse_f64),
-                excitation_wavelength_nm: node
-                    .attribute("ExcitationWavelength")
-                    .and_then(parse_f64),
-            })
-            .collect::<Vec<_>>();
-
-        let mut planes = vec![
-            PlaneMetadata::default();
-            (size_z.saturating_mul(size_c_logical).saturating_mul(size_t))
-                as usize
-        ];
-        for plane_node in pixels.children().filter(|node| node.has_tag_name("Plane")) {
-            let z = plane_node
-                .attribute("TheZ")
-                .and_then(parse_u32)
-                .unwrap_or(0);
-            let c = plane_node
-                .attribute("TheC")
-                .and_then(parse_u32)
-                .unwrap_or(0);
-            let t = plane_node
-                .attribute("TheT")
-                .and_then(parse_u32)
-                .unwrap_or(0);
-            let index = plane_index_for_dimension_order(
-                dimension_order,
-                size_z,
-                size_c_logical,
-                size_t,
-                z,
-                c,
-                t,
-            );
-            if let Some(plane) = planes.get_mut(index as usize) {
-                *plane = PlaneMetadata {
-                    z,
-                    c,
-                    t,
-                    delta_t_seconds: plane_node.attribute("DeltaT").and_then(parse_f64),
-                    position_x_um: plane_node.attribute("PositionX").and_then(parse_f64),
-                    position_y_um: plane_node.attribute("PositionY").and_then(parse_f64),
-                    position_z_um: plane_node.attribute("PositionZ").and_then(parse_f64),
-                };
-            }
+                emission_wavelength_nm: optional_length_nm(
+                    node,
+                    "EmissionWavelength",
+                    "EmissionWavelengthUnit",
+                    "nm",
+                )?,
+                excitation_wavelength_nm: optional_length_nm(
+                    node,
+                    "ExcitationWavelength",
+                    "ExcitationWavelengthUnit",
+                    "nm",
+                )?,
+            });
         }
+
+        let planes = pixels
+            .children()
+            .filter(|node| node.has_tag_name("Plane"))
+            .map(|plane_node| {
+                Ok(PlaneMetadata {
+                    z: positive_or_zero_u32_attribute(plane_node, "TheZ", 0)?,
+                    c: positive_or_zero_u32_attribute(plane_node, "TheC", 0)?,
+                    t: positive_or_zero_u32_attribute(plane_node, "TheT", 0)?,
+                    delta_t_seconds: optional_time_seconds(
+                        plane_node,
+                        "DeltaT",
+                        "DeltaTUnit",
+                        "s",
+                    )?,
+                    position_x_um: optional_length_um(
+                        plane_node,
+                        "PositionX",
+                        "PositionXUnit",
+                        "reference frame",
+                    )?,
+                    position_y_um: optional_length_um(
+                        plane_node,
+                        "PositionY",
+                        "PositionYUnit",
+                        "reference frame",
+                    )?,
+                    position_z_um: optional_length_um(
+                        plane_node,
+                        "PositionZ",
+                        "PositionZUnit",
+                        "reference frame",
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let tiff_data = pixels
             .children()
@@ -1348,14 +1851,19 @@ fn parse_ome_dataset(
                 used_files.insert(file.to_string_lossy().to_string(), file.clone());
                 Ok(OmeTiffData {
                     file,
-                    ifd: node.attribute("IFD").and_then(parse_u32).unwrap_or(0) as usize,
-                    first_z: node.attribute("FirstZ").and_then(parse_u32).unwrap_or(0),
-                    first_c: node.attribute("FirstC").and_then(parse_u32).unwrap_or(0),
-                    first_t: node.attribute("FirstT").and_then(parse_u32).unwrap_or(0),
-                    plane_count: node
-                        .attribute("PlaneCount")
-                        .and_then(parse_u32)
-                        .unwrap_or(1),
+                    ifd: optional_u32_attribute(node, "IFD")?
+                        .map(|value| {
+                            usize::try_from(value).map_err(|_| {
+                                BioFormatsError::Format(
+                                    "OME TiffData IFD does not fit in usize".into(),
+                                )
+                            })
+                        })
+                        .transpose()?,
+                    first_z: optional_u32_attribute(node, "FirstZ")?.unwrap_or(0),
+                    first_c: optional_u32_attribute(node, "FirstC")?.unwrap_or(0),
+                    first_t: optional_u32_attribute(node, "FirstT")?.unwrap_or(0),
+                    plane_count: optional_u32_attribute(node, "PlaneCount")?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1366,6 +1874,10 @@ fn parse_ome_dataset(
                     default_file.to_string_lossy().to_string(),
                     default_file.to_path_buf(),
                 );
+            } else {
+                return Err(BioFormatsError::Format(
+                    "companion OME metadata does not map any TIFF files".into(),
+                ));
             }
         }
 
@@ -1373,22 +1885,50 @@ fn parse_ome_dataset(
             size_x,
             size_y,
             size_z,
-            size_c_logical,
+            size_c_samples,
             size_t,
             pixel_type,
+            significant_bits,
             dimension_order,
             channels,
+            channel_samples_per_pixel,
             planes,
             tiff_data,
-            physical_size_x_um: pixels.attribute("PhysicalSizeX").and_then(parse_f64),
-            physical_size_y_um: pixels.attribute("PhysicalSizeY").and_then(parse_f64),
-            physical_size_z_um: pixels.attribute("PhysicalSizeZ").and_then(parse_f64),
-            time_increment_seconds: pixels.attribute("TimeIncrement").and_then(parse_f64),
+            physical_size_x_um: optional_length_um(
+                pixels,
+                "PhysicalSizeX",
+                "PhysicalSizeXUnit",
+                "µm",
+            )?,
+            physical_size_y_um: optional_length_um(
+                pixels,
+                "PhysicalSizeY",
+                "PhysicalSizeYUnit",
+                "µm",
+            )?,
+            physical_size_z_um: optional_length_um(
+                pixels,
+                "PhysicalSizeZ",
+                "PhysicalSizeZUnit",
+                "µm",
+            )?,
+            time_increment_seconds: optional_time_seconds(
+                pixels,
+                "TimeIncrement",
+                "TimeIncrementUnit",
+                "s",
+            )?,
             acquisition_timestamp,
             objective_model: objective_model.clone(),
             objective_magnification,
             objective_na,
         });
+    }
+
+    if images.is_empty() {
+        return Err(BioFormatsError::Format(
+            "OME metadata contains no Image elements".into(),
+        ));
     }
 
     Ok(OmeDataset {
@@ -1415,12 +1955,201 @@ fn parse_u32(value: &str) -> Option<u32> {
     value.parse().ok()
 }
 
+fn positive_u32_attribute(
+    node: roxmltree::Node<'_, '_>,
+    name: &str,
+    default: Option<u32>,
+) -> Result<u32> {
+    match node.attribute(name) {
+        Some(value) => parse_u32(value).filter(|value| *value > 0).ok_or_else(|| {
+            BioFormatsError::Format(format!("OME {name} must be a positive integer"))
+        }),
+        None => {
+            default.ok_or_else(|| BioFormatsError::Format(format!("OME Pixels missing {name}")))
+        }
+    }
+}
+
+fn positive_or_zero_u32_attribute(
+    node: roxmltree::Node<'_, '_>,
+    name: &str,
+    default: u32,
+) -> Result<u32> {
+    match node.attribute(name) {
+        Some(value) => parse_u32(value).ok_or_else(|| {
+            BioFormatsError::Format(format!("OME {name} must be a non-negative integer"))
+        }),
+        None => Ok(default),
+    }
+}
+
 fn parse_i32(value: &str) -> Option<i32> {
     value.parse().ok()
 }
 
 fn parse_f64(value: &str) -> Option<f64> {
     value.parse().ok()
+}
+
+fn optional_u32_attribute(node: roxmltree::Node<'_, '_>, name: &str) -> Result<Option<u32>> {
+    let Some(raw) = node.attribute(name) else {
+        return Ok(None);
+    };
+    raw.parse::<u32>()
+        .map(Some)
+        .map_err(|_| BioFormatsError::Format(format!("OME {name} must be a non-negative integer")))
+}
+
+fn optional_quantity(
+    node: roxmltree::Node<'_, '_>,
+    value_name: &str,
+    unit_name: &str,
+    default_unit: &str,
+    target_unit: &str,
+    factor: fn(&str) -> Option<f64>,
+) -> Result<Option<f64>> {
+    let Some(raw_value) = node.attribute(value_name) else {
+        return Ok(None);
+    };
+    let value = raw_value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| {
+            BioFormatsError::Format(format!("OME {value_name} must be a finite number"))
+        })?;
+    let unit = node.attribute(unit_name).unwrap_or(default_unit);
+    let factor = factor(unit).ok_or_else(|| {
+        BioFormatsError::UnsupportedFormat(format!(
+            "OME {value_name} unit {unit:?} cannot be represented as {target_unit}"
+        ))
+    })?;
+    let converted = value * factor;
+    if !converted.is_finite() {
+        return Err(BioFormatsError::Format(format!(
+            "OME {value_name} overflows after conversion to {target_unit}"
+        )));
+    }
+    Ok(Some(converted))
+}
+
+fn length_factor_um(unit: &str) -> Option<f64> {
+    Some(match unit {
+        "Ym" => 1e30,
+        "Zm" => 1e27,
+        "Em" => 1e24,
+        "Pm" => 1e21,
+        "Tm" => 1e18,
+        "Gm" => 1e15,
+        "Mm" => 1e12,
+        "km" => 1e9,
+        "hm" => 1e8,
+        "dam" => 1e7,
+        "m" => 1e6,
+        "dm" => 1e5,
+        "cm" => 1e4,
+        "mm" => 1e3,
+        "µm" | "μm" | "um" => 1.0,
+        "nm" => 1e-3,
+        "pm" => 1e-6,
+        "fm" => 1e-9,
+        "am" => 1e-12,
+        "zm" => 1e-15,
+        "ym" => 1e-18,
+        "Å" => 1e-4,
+        "thou" => 25.4,
+        "li" => 25_400.0 / 12.0,
+        "in" => 25_400.0,
+        "ft" => 304_800.0,
+        "yd" => 914_400.0,
+        "mi" => 1_609_344_000.0,
+        "ua" => 1.495_978_707e17,
+        "ly" => 9.460_730_472_580_8e21,
+        "pc" => 3.085_677_581_491_367e22,
+        "pt" => 25_400.0 / 72.0,
+        "pixel" | "reference frame" => return None,
+        _ => return None,
+    })
+}
+
+fn time_factor_seconds(unit: &str) -> Option<f64> {
+    Some(match unit {
+        "Ys" => 1e24,
+        "Zs" => 1e21,
+        "Es" => 1e18,
+        "Ps" => 1e15,
+        "Ts" => 1e12,
+        "Gs" => 1e9,
+        "Ms" => 1e6,
+        "ks" => 1e3,
+        "hs" => 1e2,
+        "das" => 1e1,
+        "s" => 1.0,
+        "ds" => 1e-1,
+        "cs" => 1e-2,
+        "ms" => 1e-3,
+        "µs" | "μs" | "us" => 1e-6,
+        "ns" => 1e-9,
+        "ps" => 1e-12,
+        "fs" => 1e-15,
+        "as" => 1e-18,
+        "zs" => 1e-21,
+        "ys" => 1e-24,
+        "min" => 60.0,
+        "h" => 3_600.0,
+        "d" => 86_400.0,
+        _ => return None,
+    })
+}
+
+fn optional_length_um(
+    node: roxmltree::Node<'_, '_>,
+    value_name: &str,
+    unit_name: &str,
+    default_unit: &str,
+) -> Result<Option<f64>> {
+    optional_quantity(
+        node,
+        value_name,
+        unit_name,
+        default_unit,
+        "µm",
+        length_factor_um,
+    )
+}
+
+fn optional_length_nm(
+    node: roxmltree::Node<'_, '_>,
+    value_name: &str,
+    unit_name: &str,
+    default_unit: &str,
+) -> Result<Option<f64>> {
+    optional_length_um(node, value_name, unit_name, default_unit)?
+        .map(|value| {
+            let converted = value * 1_000.0;
+            converted.is_finite().then_some(converted).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "OME {value_name} overflows after conversion to nm"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn optional_time_seconds(
+    node: roxmltree::Node<'_, '_>,
+    value_name: &str,
+    unit_name: &str,
+    default_unit: &str,
+) -> Result<Option<f64>> {
+    optional_quantity(
+        node,
+        value_name,
+        unit_name,
+        default_unit,
+        "s",
+        time_factor_seconds,
+    )
 }
 
 fn plane_index_for_dimension_order(
@@ -1459,13 +2188,95 @@ fn build_ome_series(
         .images
         .iter()
         .map(|image| {
-            let mut planes = vec![
-                None;
-                image
-                    .size_z
-                    .saturating_mul(image.size_c_logical)
-                    .saturating_mul(image.size_t) as usize
-            ];
+            let (sample_file_index, sample_ifd_index) =
+                if let Some(tiff_data) = image.tiff_data.first() {
+                    (
+                        *file_indices.get(&tiff_data.file).ok_or_else(|| {
+                            BioFormatsError::Format(format!(
+                                "OME-TIFF referenced file {} was not loaded",
+                                tiff_data.file.display()
+                            ))
+                        })?,
+                        tiff_data.ifd.unwrap_or(0),
+                    )
+                } else {
+                    (0, 0)
+                };
+            let sample_file = minimal.files.get(sample_file_index).ok_or_else(|| {
+                BioFormatsError::Format("OME-TIFF does not reference a TIFF file".into())
+            })?;
+            let sample_ifd = sample_file.ifds.get(sample_ifd_index).ok_or_else(|| {
+                BioFormatsError::Format(format!(
+                    "OME-TIFF references missing IFD {sample_ifd_index}"
+                ))
+            })?;
+            let info = ifd_info(sample_ifd, sample_file.parser.little_endian)?;
+            if info.width != image.size_x || info.height != image.size_y {
+                return Err(BioFormatsError::Format(format!(
+                    "OME Pixels dimensions {}x{} do not match TIFF IFD dimensions {}x{}",
+                    image.size_x, image.size_y, info.width, info.height
+                )));
+            }
+            if info.pixel_type != image.pixel_type {
+                return Err(BioFormatsError::Format(format!(
+                    "OME pixel type {:?} does not match TIFF pixel type {:?}",
+                    image.pixel_type, info.pixel_type
+                )));
+            }
+            if image.significant_bits > info.bits_per_sample as u8 {
+                return Err(BioFormatsError::Format(format!(
+                    "OME SignificantBits {} exceeds TIFF BitsPerSample {}",
+                    image.significant_bits, info.bits_per_sample
+                )));
+            }
+
+            let samples_per_pixel = returned_samples_per_pixel(&info);
+            if image.size_c_samples % samples_per_pixel != 0 {
+                return Err(BioFormatsError::Format(format!(
+                    "OME SizeC {} is not divisible by TIFF SamplesPerPixel {}",
+                    image.size_c_samples, samples_per_pixel
+                )));
+            }
+            let logical_channel_count = image.size_c_samples / samples_per_pixel;
+            if logical_channel_count == 0 {
+                return Err(BioFormatsError::Format(
+                    "OME-TIFF has no logical channels".into(),
+                ));
+            }
+            if !image.channel_samples_per_pixel.is_empty() {
+                if image.channels.len() != logical_channel_count as usize {
+                    return Err(BioFormatsError::Format(format!(
+                        "OME declares {} logical Channel elements but SizeC/SamplesPerPixel requires {logical_channel_count}",
+                        image.channels.len()
+                    )));
+                }
+                if image
+                    .channel_samples_per_pixel
+                    .iter()
+                    .any(|count| *count != samples_per_pixel)
+                {
+                    return Err(BioFormatsError::UnsupportedFormat(
+                        "OME-TIFF channels with differing SamplesPerPixel are not yet supported"
+                            .into(),
+                    ));
+                }
+            }
+
+            let image_count = image
+                .size_z
+                .checked_mul(logical_channel_count)
+                .and_then(|count| count.checked_mul(image.size_t))
+                .ok_or_else(|| {
+                    BioFormatsError::Format("OME-TIFF plane count exceeds u32".into())
+                })?;
+            let plane_count = usize::try_from(image_count).map_err(|_| {
+                BioFormatsError::Format("OME-TIFF plane count does not fit in memory".into())
+            })?;
+            let mut planes = Vec::new();
+            planes.try_reserve_exact(plane_count).map_err(|_| {
+                BioFormatsError::Format("OME-TIFF plane map does not fit in memory".into())
+            })?;
+            planes.resize(plane_count, None);
             if image.tiff_data.is_empty() {
                 let default_file_index = 0usize;
                 for (index, plane) in planes.iter_mut().enumerate() {
@@ -1483,22 +2294,70 @@ fn build_ome_series(
                             tiff_data.file.display()
                         ))
                     })?;
+                    if tiff_data.first_z >= image.size_z
+                        || tiff_data.first_c >= logical_channel_count
+                        || tiff_data.first_t >= image.size_t
+                    {
+                        return Err(BioFormatsError::Format(format!(
+                            "OME-TIFF TiffData coordinate ({}, {}, {}) is out of range",
+                            tiff_data.first_z, tiff_data.first_c, tiff_data.first_t
+                        )));
+                    }
                     let start = plane_index_for_dimension_order(
                         image.dimension_order,
                         image.size_z,
-                        image.size_c_logical,
+                        logical_channel_count,
                         image.size_t,
                         tiff_data.first_z,
                         tiff_data.first_c,
                         tiff_data.first_t,
                     );
-                    for offset in 0..tiff_data.plane_count {
-                        if let Some(slot) = planes.get_mut((start + offset) as usize) {
-                            *slot = Some(PlaneRef {
+                    let plane_count = match (tiff_data.ifd, tiff_data.plane_count) {
+                        // OME's implicit form `<TiffData/>` maps consecutive
+                        // IFDs from the referenced file, rather than only IFD 0.
+                        (None, None) => {
+                            let remaining = image_count.checked_sub(start).ok_or_else(|| {
+                                BioFormatsError::Format(
+                                    "OME-TIFF implicit TiffData starts past the image".into(),
+                                )
+                            })?;
+                            u32::try_from(minimal.files[file_index].ifds.len())
+                                .unwrap_or(u32::MAX)
+                                .min(remaining)
+                        }
+                        (_, count) => count.unwrap_or(1),
+                    };
+                    for offset in 0..plane_count {
+                        let plane_index = start.checked_add(offset).ok_or_else(|| {
+                            BioFormatsError::Format(
+                                "OME-TIFF TiffData plane index overflows u32".into(),
+                            )
+                        })?;
+                        let slot = planes.get_mut(plane_index as usize).ok_or_else(|| {
+                            BioFormatsError::Format(format!(
+                                "OME-TIFF TiffData maps plane {plane_index} out of range"
+                            ))
+                        })?;
+                        let ifd_index = tiff_data
+                            .ifd
+                            .unwrap_or(0)
+                            .checked_add(offset as usize)
+                            .ok_or_else(|| {
+                                BioFormatsError::Format(
+                                    "OME-TIFF TiffData IFD index overflows usize".into(),
+                                )
+                            })?;
+                        if slot
+                            .replace(PlaneRef {
                                 file_index,
-                                ifd_index: tiff_data.ifd + offset as usize,
+                                ifd_index,
                                 sub_resolution: 0,
-                            });
+                            })
+                            .is_some()
+                        {
+                            return Err(BioFormatsError::Format(format!(
+                                "OME-TIFF plane {plane_index} is mapped more than once"
+                            )));
                         }
                     }
                 }
@@ -1513,38 +2372,97 @@ fn build_ome_series(
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            let first_plane = &root_planes[0];
-            let first_file = &minimal.files[first_plane.file_index];
-            let ifd = first_file
-                .ifds
-                .get(first_plane.ifd_index)
-                .ok_or_else(|| BioFormatsError::PlaneOutOfRange(first_plane.ifd_index as u32))?;
-            let info = ifd_info(ifd, first_file.parser.little_endian)?;
-            let rgb_count = if matches!(info.photometric, Photometric::Rgb | Photometric::YCbCr)
-                && info.samples_per_pixel >= 3
-            {
-                info.samples_per_pixel as u32
-            } else {
-                1
+            for (plane_index, plane) in root_planes.iter().enumerate() {
+                let file = minimal.files.get(plane.file_index).ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "OME-TIFF plane {plane_index} references a missing file"
+                    ))
+                })?;
+                let ifd = file.ifds.get(plane.ifd_index).ok_or_else(|| {
+                    BioFormatsError::Format(format!(
+                        "OME-TIFF plane {plane_index} references missing IFD {}",
+                        plane.ifd_index
+                    ))
+                })?;
+                let plane_info = ifd_info(ifd, file.parser.little_endian)?;
+                if !same_plane_layout(&plane_info, &info)
+                    || file.parser.little_endian != sample_file.parser.little_endian
+                {
+                    return Err(BioFormatsError::UnsupportedFormat(format!(
+                        "OME-TIFF plane {plane_index} has a different pixel layout"
+                    )));
+                }
+            }
+
+            let coordinate_metadata = ImageMetadata {
+                size_z: image.size_z,
+                size_c: image.size_c_samples,
+                size_t: image.size_t,
+                samples_per_pixel,
+                image_count,
+                dimension_order: image.dimension_order,
+                ..ImageMetadata::default()
             };
+            let mut plane_metadata = Vec::new();
+            plane_metadata.try_reserve_exact(plane_count).map_err(|_| {
+                BioFormatsError::Format("OME-TIFF plane metadata does not fit in memory".into())
+            })?;
+            for index in 0..image_count {
+                let (z, c, t) = coordinate_metadata.get_zct_coords(index);
+                plane_metadata.push(PlaneMetadata {
+                    z,
+                    c,
+                    t,
+                    ..PlaneMetadata::default()
+                });
+            }
+            let mut explicit_planes = Vec::new();
+            explicit_planes
+                .try_reserve_exact(plane_count)
+                .map_err(|_| {
+                    BioFormatsError::Format(
+                        "OME-TIFF explicit plane map does not fit in memory".into(),
+                    )
+                })?;
+            explicit_planes.resize(plane_count, false);
+            for plane in &image.planes {
+                if plane.z >= image.size_z
+                    || plane.c >= logical_channel_count
+                    || plane.t >= image.size_t
+                {
+                    return Err(BioFormatsError::Format(format!(
+                        "OME Plane coordinate ({}, {}, {}) is out of range",
+                        plane.z, plane.c, plane.t
+                    )));
+                }
+                let index = coordinate_metadata.get_index(plane.z, plane.c, plane.t) as usize;
+                if explicit_planes[index] {
+                    return Err(BioFormatsError::Format(format!(
+                        "OME Plane metadata for index {index} is duplicated"
+                    )));
+                }
+                explicit_planes[index] = true;
+                plane_metadata[index] = plane.clone();
+            }
+
+            let is_rgb = matches!(info.photometric, Photometric::Rgb | Photometric::YCbCr)
+                && info.samples_per_pixel >= 3;
             let mut metadata = ImageMetadata {
                 size_x: image.size_x,
                 size_y: image.size_y,
                 size_z: image.size_z,
-                size_c: image.size_c_logical.saturating_mul(rgb_count),
+                size_c: image.size_c_samples,
                 size_t: image.size_t,
                 pixel_type: image.pixel_type,
-                bits_per_pixel: (image.pixel_type.bytes_per_sample() * 8) as u8,
-                image_count: image
-                    .size_z
-                    .saturating_mul(image.size_c_logical)
-                    .saturating_mul(image.size_t),
+                bits_per_pixel: image.significant_bits,
+                samples_per_pixel,
+                image_count,
                 dimension_order: image.dimension_order,
-                is_rgb: rgb_count > 1,
+                is_rgb,
                 is_interleaved: info.planar_config == 1,
                 is_indexed: info.photometric == Photometric::Palette,
                 is_false_color: true,
-                is_little_endian: first_file.parser.little_endian,
+                is_little_endian: sample_file.parser.little_endian,
                 resolution_count: 1,
                 series_metadata: HashMap::new(),
                 lookup_table: info.color_map.as_ref().map(|(red, green, blue)| {
@@ -1563,7 +2481,7 @@ fn build_ome_series(
                 objective_magnification: image.objective_magnification,
                 objective_na: image.objective_na,
                 channel_metadata: image.channels.clone(),
-                plane_metadata: image.planes.clone(),
+                plane_metadata,
                 used_files: used_files.to_vec(),
             };
             if let Some(description) = &info.image_description {
@@ -1580,4 +2498,572 @@ fn build_ome_series(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tiff::ifd::IfdValue;
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempTiff {
+        path: PathBuf,
+    }
+
+    impl TempTiff {
+        fn write(name: &str, bytes: &[u8]) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "bioformats_rs_planar_{name}_{}_{}.tif",
+                std::process::id(),
+                nonce
+            ));
+            fs::write(&path, bytes).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempTiff {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+
+    fn push_tag(out: &mut Vec<u8>, tag: u16, field_type: u16, count: u32, value: u32) {
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&field_type.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_tag_be(out: &mut Vec<u8>, tag: u16, field_type: u16, count: u32, value: u32) {
+        out.extend_from_slice(&tag.to_be_bytes());
+        out.extend_from_slice(&field_type.to_be_bytes());
+        out.extend_from_slice(&count.to_be_bytes());
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+
+    fn planar_stripped_tiff() -> Vec<u8> {
+        const ENTRY_COUNT: u16 = 12;
+        const IFD_OFFSET: u32 = 8;
+        const IFD_SIZE: u32 = 2 + ENTRY_COUNT as u32 * 12 + 4;
+        const OFFSETS_OFFSET: u32 = IFD_OFFSET + IFD_SIZE;
+        const COUNTS_OFFSET: u32 = OFFSETS_OFFSET + 2 * 4;
+        const PIXELS_OFFSET: u32 = COUNTS_OFFSET + 2 * 4;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"II");
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&IFD_OFFSET.to_le_bytes());
+        out.extend_from_slice(&ENTRY_COUNT.to_le_bytes());
+        push_tag(&mut out, tag::IMAGE_WIDTH, 4, 1, 3);
+        push_tag(&mut out, tag::IMAGE_LENGTH, 4, 1, 2);
+        push_tag(&mut out, tag::BITS_PER_SAMPLE, 3, 2, 8 | (8 << 16));
+        push_tag(&mut out, tag::COMPRESSION, 3, 1, 1);
+        push_tag(
+            &mut out,
+            tag::PHOTOMETRIC_INTERPRETATION,
+            3,
+            1,
+            Photometric::MinIsBlack as u32,
+        );
+        push_tag(&mut out, tag::STRIP_OFFSETS, 4, 2, OFFSETS_OFFSET);
+        push_tag(&mut out, tag::SAMPLES_PER_PIXEL, 3, 1, 2);
+        push_tag(&mut out, tag::ROWS_PER_STRIP, 4, 1, 2);
+        push_tag(&mut out, tag::STRIP_BYTE_COUNTS, 4, 2, COUNTS_OFFSET);
+        push_tag(&mut out, tag::PLANAR_CONFIGURATION, 3, 1, 2);
+        push_tag(&mut out, tag::PREDICTOR, 3, 1, 2);
+        push_tag(&mut out, tag::EXTRA_SAMPLES, 3, 1, 2);
+        out.extend_from_slice(&0u32.to_le_bytes());
+
+        for offset in [PIXELS_OFFSET, PIXELS_OFFSET + 6] {
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+        for _ in 0..2 {
+            out.extend_from_slice(&6u32.to_le_bytes());
+        }
+
+        // Horizontal predictor values, ordered by component; each strip has two rows.
+        out.extend_from_slice(&[1, 1, 1, 4, 1, 1]);
+        out.extend_from_slice(&[10, 10, 10, 40, 10, 10]);
+        out
+    }
+
+    fn planar_tiled_tiff() -> Vec<u8> {
+        const ENTRY_COUNT: u16 = 13;
+        const IFD_OFFSET: u32 = 8;
+        const IFD_SIZE: u32 = 2 + ENTRY_COUNT as u32 * 12 + 4;
+        const OFFSETS_OFFSET: u32 = IFD_OFFSET + IFD_SIZE;
+        const COUNTS_OFFSET: u32 = OFFSETS_OFFSET + 8 * 4;
+        const PIXELS_OFFSET: u32 = COUNTS_OFFSET + 8 * 4;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"II");
+        out.extend_from_slice(&42u16.to_le_bytes());
+        out.extend_from_slice(&IFD_OFFSET.to_le_bytes());
+        out.extend_from_slice(&ENTRY_COUNT.to_le_bytes());
+        push_tag(&mut out, tag::IMAGE_WIDTH, 4, 1, 3);
+        push_tag(&mut out, tag::IMAGE_LENGTH, 4, 1, 2);
+        push_tag(&mut out, tag::BITS_PER_SAMPLE, 3, 2, 8 | (8 << 16));
+        push_tag(&mut out, tag::COMPRESSION, 3, 1, 1);
+        push_tag(
+            &mut out,
+            tag::PHOTOMETRIC_INTERPRETATION,
+            3,
+            1,
+            Photometric::MinIsBlack as u32,
+        );
+        push_tag(&mut out, tag::SAMPLES_PER_PIXEL, 3, 1, 2);
+        push_tag(&mut out, tag::PLANAR_CONFIGURATION, 3, 1, 2);
+        push_tag(&mut out, tag::PREDICTOR, 3, 1, 2);
+        push_tag(&mut out, tag::TILE_WIDTH, 4, 1, 2);
+        push_tag(&mut out, tag::TILE_LENGTH, 4, 1, 1);
+        push_tag(&mut out, tag::TILE_OFFSETS, 4, 8, OFFSETS_OFFSET);
+        push_tag(&mut out, tag::TILE_BYTE_COUNTS, 4, 8, COUNTS_OFFSET);
+        push_tag(&mut out, tag::EXTRA_SAMPLES, 3, 1, 2);
+        out.extend_from_slice(&0u32.to_le_bytes());
+
+        for index in 0..8 {
+            out.extend_from_slice(&(PIXELS_OFFSET + index * 2).to_le_bytes());
+        }
+        for _ in 0..8 {
+            out.extend_from_slice(&2u32.to_le_bytes());
+        }
+
+        // Horizontal predictor values, ordered by component then tile.
+        out.extend_from_slice(&[1, 1, 3, 253, 4, 1, 6, 250]);
+        out.extend_from_slice(&[10, 10, 30, 226, 40, 10, 60, 196]);
+        out
+    }
+
+    fn padded_final_legacy_deflate_strip_tiff() -> Vec<u8> {
+        const ENTRY_COUNT: u16 = 10;
+        const IFD_OFFSET: u32 = 8;
+        const IFD_SIZE: u32 = 2 + ENTRY_COUNT as u32 * 12 + 4;
+        const OFFSETS_OFFSET: u32 = IFD_OFFSET + IFD_SIZE;
+        const COUNTS_OFFSET: u32 = OFFSETS_OFFSET + 2 * 4;
+        const PIXELS_OFFSET: u32 = COUNTS_OFFSET + 2 * 4;
+
+        let encode = |pixels: &[u8]| {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(pixels).unwrap();
+            encoder.finish().unwrap()
+        };
+        let first = encode(&[1, 2, 3, 4, 5, 6]);
+        let last = encode(&[7, 8, 9, 200, 201, 202]);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"II");
+        out.extend_from_slice(&42_u16.to_le_bytes());
+        out.extend_from_slice(&IFD_OFFSET.to_le_bytes());
+        out.extend_from_slice(&ENTRY_COUNT.to_le_bytes());
+        push_tag(&mut out, tag::IMAGE_WIDTH, 4, 1, 3);
+        push_tag(&mut out, tag::IMAGE_LENGTH, 4, 1, 3);
+        push_tag(&mut out, tag::BITS_PER_SAMPLE, 3, 1, 8);
+        push_tag(&mut out, tag::COMPRESSION, 3, 1, 32946);
+        push_tag(
+            &mut out,
+            tag::PHOTOMETRIC_INTERPRETATION,
+            3,
+            1,
+            Photometric::MinIsBlack as u32,
+        );
+        push_tag(&mut out, tag::STRIP_OFFSETS, 4, 2, OFFSETS_OFFSET);
+        push_tag(&mut out, tag::SAMPLES_PER_PIXEL, 3, 1, 1);
+        push_tag(&mut out, tag::ROWS_PER_STRIP, 4, 1, 2);
+        push_tag(&mut out, tag::STRIP_BYTE_COUNTS, 4, 2, COUNTS_OFFSET);
+        push_tag(&mut out, tag::PLANAR_CONFIGURATION, 3, 1, 1);
+        out.extend_from_slice(&0_u32.to_le_bytes());
+
+        out.extend_from_slice(&PIXELS_OFFSET.to_le_bytes());
+        out.extend_from_slice(&(PIXELS_OFFSET + first.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(first.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(last.len() as u32).to_le_bytes());
+        out.extend_from_slice(&first);
+        out.extend_from_slice(&last);
+        out
+    }
+
+    fn big_endian_sixteen_bit_tiff() -> Vec<u8> {
+        const ENTRY_COUNT: u16 = 10;
+        const IFD_OFFSET: u32 = 8;
+        const IFD_SIZE: u32 = 2 + ENTRY_COUNT as u32 * 12 + 4;
+        const PIXELS_OFFSET: u32 = IFD_OFFSET + IFD_SIZE;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"MM");
+        out.extend_from_slice(&42u16.to_be_bytes());
+        out.extend_from_slice(&IFD_OFFSET.to_be_bytes());
+        out.extend_from_slice(&ENTRY_COUNT.to_be_bytes());
+        push_tag_be(&mut out, tag::IMAGE_WIDTH, 4, 1, 3);
+        push_tag_be(&mut out, tag::IMAGE_LENGTH, 4, 1, 2);
+        push_tag_be(&mut out, tag::BITS_PER_SAMPLE, 3, 1, 16 << 16);
+        push_tag_be(&mut out, tag::COMPRESSION, 3, 1, 1 << 16);
+        push_tag_be(
+            &mut out,
+            tag::PHOTOMETRIC_INTERPRETATION,
+            3,
+            1,
+            (Photometric::MinIsBlack as u32) << 16,
+        );
+        push_tag_be(&mut out, tag::STRIP_OFFSETS, 4, 1, PIXELS_OFFSET);
+        push_tag_be(&mut out, tag::SAMPLES_PER_PIXEL, 3, 1, 1 << 16);
+        push_tag_be(&mut out, tag::ROWS_PER_STRIP, 4, 1, 2);
+        push_tag_be(&mut out, tag::STRIP_BYTE_COUNTS, 4, 1, 12);
+        push_tag_be(&mut out, tag::PREDICTOR, 3, 1, 2 << 16);
+        out.extend_from_slice(&0u32.to_be_bytes());
+
+        for value in [0x0100_u16, 0x0002, 0x00fe, 0x1000, 0x0001, 0x0002] {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+        out
+    }
+
+    fn grayscale_alpha_info(planar_config: u16) -> IfdInfo {
+        let mut ifd = Ifd::default();
+        ifd.entries
+            .insert(tag::IMAGE_WIDTH, IfdValue::Long(vec![2]));
+        ifd.entries
+            .insert(tag::IMAGE_LENGTH, IfdValue::Long(vec![1]));
+        ifd.entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![8, 8]));
+        ifd.entries.insert(
+            tag::PHOTOMETRIC_INTERPRETATION,
+            IfdValue::Short(vec![Photometric::MinIsBlack as u16]),
+        );
+        ifd.entries
+            .insert(tag::SAMPLES_PER_PIXEL, IfdValue::Short(vec![2]));
+        ifd.entries.insert(
+            tag::PLANAR_CONFIGURATION,
+            IfdValue::Short(vec![planar_config]),
+        );
+        ifd.entries
+            .insert(tag::EXTRA_SAMPLES, IfdValue::Short(vec![2]));
+        ifd_info(&ifd, true).unwrap()
+    }
+
+    fn baseline_ifd() -> Ifd {
+        let mut ifd = Ifd::default();
+        ifd.entries
+            .insert(tag::IMAGE_WIDTH, IfdValue::Long(vec![2]));
+        ifd.entries
+            .insert(tag::IMAGE_LENGTH, IfdValue::Long(vec![1]));
+        ifd.entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![8]));
+        ifd.entries.insert(
+            tag::PHOTOMETRIC_INTERPRETATION,
+            IfdValue::Short(vec![Photometric::MinIsBlack as u16]),
+        );
+        ifd
+    }
+
+    #[test]
+    fn rejects_tiff_layouts_that_need_unported_sample_transforms() {
+        let mut packed = baseline_ifd();
+        packed
+            .entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![1]));
+        assert!(matches!(
+            ifd_info(&packed, true),
+            Err(BioFormatsError::UnsupportedFormat(_))
+        ));
+
+        let mut floating_predictor = baseline_ifd();
+        floating_predictor
+            .entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![32]));
+        floating_predictor
+            .entries
+            .insert(tag::SAMPLE_FORMAT, IfdValue::Short(vec![3]));
+        floating_predictor
+            .entries
+            .insert(tag::PREDICTOR, IfdValue::Short(vec![3]));
+        assert!(matches!(
+            ifd_info(&floating_predictor, true),
+            Err(BioFormatsError::UnsupportedFormat(_))
+        ));
+
+        let mut white_is_zero = baseline_ifd();
+        white_is_zero.entries.insert(
+            tag::PHOTOMETRIC_INTERPRETATION,
+            IfdValue::Short(vec![Photometric::MinIsWhite as u16]),
+        );
+        assert!(matches!(
+            ifd_info(&white_is_zero, true),
+            Err(BioFormatsError::UnsupportedFormat(_))
+        ));
+
+        let mut raw_ycbcr = baseline_ifd();
+        raw_ycbcr.entries.insert(
+            tag::PHOTOMETRIC_INTERPRETATION,
+            IfdValue::Short(vec![Photometric::YCbCr as u16]),
+        );
+        assert!(matches!(
+            ifd_info(&raw_ycbcr, true),
+            Err(BioFormatsError::UnsupportedFormat(_))
+        ));
+    }
+
+    #[test]
+    fn series_layout_key_distinguishes_sample_format_planar_and_photometric() {
+        let unsigned = ifd_info(&baseline_ifd(), true).unwrap();
+
+        let mut signed_ifd = baseline_ifd();
+        signed_ifd
+            .entries
+            .insert(tag::SAMPLE_FORMAT, IfdValue::Short(vec![2]));
+        let signed = ifd_info(&signed_ifd, true).unwrap();
+        assert!(!same_plane_layout(&unsigned, &signed));
+
+        let chunky = grayscale_alpha_info(1);
+        let planar = grayscale_alpha_info(2);
+        assert!(!same_plane_layout(&chunky, &planar));
+
+        let mut palette = unsigned.clone();
+        palette.photometric = Photometric::Palette;
+        assert!(!same_plane_layout(&unsigned, &palette));
+    }
+
+    #[test]
+    fn metadata_reports_chunky_grayscale_alpha_samples() {
+        let info = grayscale_alpha_info(1);
+        let metadata = generic_metadata_from_info(&info, 1, &[]);
+
+        assert_eq!(metadata.samples_per_pixel, 2);
+        assert_eq!(metadata.size_c, 1);
+        assert!(!metadata.is_rgb);
+    }
+
+    #[test]
+    fn metadata_reports_all_samples_for_planar_planes() {
+        let info = grayscale_alpha_info(2);
+        let metadata = generic_metadata_from_info(&info, 1, &[]);
+
+        assert_eq!(metadata.samples_per_pixel, 2);
+        assert!(!metadata.is_interleaved);
+    }
+
+    #[test]
+    fn standard_tiff_resolution_uses_declared_units() {
+        for (unit, expected_x_um) in [(1_u16, 0.01), (2, 254.0), (3, 100.0)] {
+            let mut ifd = baseline_ifd();
+            ifd.entries
+                .insert(tag::X_RESOLUTION, IfdValue::Rational(vec![(100, 1)]));
+            ifd.entries
+                .insert(tag::RESOLUTION_UNIT, IfdValue::Short(vec![unit]));
+            let info = ifd_info(&ifd, true).unwrap();
+            let mut metadata = ImageMetadata::default();
+            apply_standard_tiff_metadata(&mut metadata, &ifd, &info, true).unwrap();
+            assert_eq!(metadata.physical_size_x_um, Some(expected_x_um));
+            assert!(matches!(
+                metadata.series_metadata.get("ResolutionUnit"),
+                Some(MetadataValue::Int(value)) if *value == i64::from(unit)
+            ));
+        }
+    }
+
+    #[test]
+    fn reads_all_planar_samples_from_strips_and_tiles() {
+        let fixtures = [
+            TempTiff::write("strips", &planar_stripped_tiff()),
+            TempTiff::write("tiles", &planar_tiled_tiff()),
+        ];
+        let expected_full = [1, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60];
+        let expected_region = [2, 3, 5, 6, 20, 30, 50, 60];
+
+        for fixture in &fixtures {
+            let mut reader = TiffReader::new();
+            reader.set_id(&fixture.path).unwrap();
+
+            assert_eq!(reader.metadata().samples_per_pixel, 2);
+            assert!(!reader.metadata().is_interleaved);
+            assert_eq!(reader.open_bytes(0).unwrap(), expected_full);
+            assert_eq!(
+                reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+                expected_region
+            );
+        }
+    }
+
+    #[test]
+    fn reads_big_endian_sixteen_bit_predictor_by_scanline() {
+        let fixture = TempTiff::write("predictor_be16", &big_endian_sixteen_bit_tiff());
+        let mut reader = TiffReader::new();
+        reader.set_id(&fixture.path).unwrap();
+
+        let expected = [0x0100_u16, 0x0102, 0x0200, 0x1000, 0x1001, 0x1003]
+            .into_iter()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+        let expected_region = [0x0102_u16, 0x0200, 0x1001, 0x1003]
+            .into_iter()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>();
+
+        assert!(!reader.metadata().is_little_endian);
+        assert_eq!(reader.open_bytes(0).unwrap(), expected);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 0, 2, 2).unwrap(),
+            expected_region
+        );
+    }
+
+    #[test]
+    fn accepts_padded_final_strip_with_legacy_zlib_code() {
+        let fixture = TempTiff::write(
+            "padded_final_legacy_deflate",
+            &padded_final_legacy_deflate_strip_tiff(),
+        );
+        let mut reader = TiffReader::new();
+        reader.set_id(&fixture.path).unwrap();
+
+        assert_eq!(reader.open_bytes(0).unwrap(), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(
+            reader.open_bytes_region(0, 1, 1, 2, 2).unwrap(),
+            [5, 6, 8, 9]
+        );
+    }
+
+    #[test]
+    fn rejects_plane_byte_count_overflow_before_allocating() {
+        let fixture = TempTiff::write("overflow", &planar_stripped_tiff());
+        let mut state = TiffFileState::open(&fixture.path).unwrap();
+        let ifd = &mut state.ifds[0];
+        ifd.entries
+            .insert(tag::IMAGE_WIDTH, IfdValue::Long(vec![u32::MAX]));
+        ifd.entries
+            .insert(tag::IMAGE_LENGTH, IfdValue::Long(vec![u32::MAX]));
+        ifd.entries
+            .insert(tag::SAMPLES_PER_PIXEL, IfdValue::Short(vec![u16::MAX]));
+        ifd.entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![64]));
+        ifd.entries
+            .insert(tag::SAMPLE_FORMAT, IfdValue::Short(vec![3]));
+        ifd.entries.insert(tag::PREDICTOR, IfdValue::Short(vec![1]));
+
+        let error = state
+            .read_plane(
+                &PlaneRef {
+                    file_index: 0,
+                    ifd_index: 0,
+                    sub_resolution: 0,
+                },
+                0,
+                0,
+                u32::MAX,
+                u32::MAX,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, BioFormatsError::PlaneByteCountOverflow));
+    }
+
+    #[test]
+    fn rejects_structural_tiff_values_that_do_not_fit_target_types() {
+        let fixture = TempTiff::write("structural_overflow", &planar_stripped_tiff());
+        let mut state = TiffFileState::open(&fixture.path).unwrap();
+        let ifd = &mut state.ifds[0];
+
+        ifd.entries.insert(
+            tag::IMAGE_WIDTH,
+            IfdValue::Long8(vec![u64::from(u32::MAX) + 1]),
+        );
+        assert!(matches!(
+            ifd_info(ifd, true),
+            Err(BioFormatsError::InvalidData(message)) if message.contains("ImageWidth")
+        ));
+
+        ifd.entries
+            .insert(tag::IMAGE_WIDTH, IfdValue::Long(vec![3]));
+        ifd.entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(Vec::new()));
+        assert!(matches!(
+            ifd_info(ifd, true),
+            Err(BioFormatsError::InvalidData(message)) if message.contains("present but empty")
+        ));
+
+        ifd.entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Long(vec![65_544]));
+        assert!(matches!(
+            ifd_info(ifd, true),
+            Err(BioFormatsError::InvalidData(message)) if message.contains("BitsPerSample")
+        ));
+
+        ifd.entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![8, 8]));
+        ifd.entries
+            .insert(tag::COMPRESSION, IfdValue::Long(vec![65_537]));
+        assert!(matches!(
+            ifd_info(ifd, true),
+            Err(BioFormatsError::InvalidData(message)) if message.contains("Compression")
+        ));
+
+        ifd.entries
+            .insert(tag::COMPRESSION, IfdValue::Short(vec![1]));
+        ifd.entries
+            .insert(tag::SAMPLES_PER_PIXEL, IfdValue::Short(vec![1]));
+        ifd.entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![8]));
+        ifd.entries.insert(
+            tag::PHOTOMETRIC_INTERPRETATION,
+            IfdValue::Short(vec![Photometric::Palette as u16]),
+        );
+        ifd.entries
+            .insert(tag::COLOR_MAP, IfdValue::Short(vec![0; 6]));
+        assert!(matches!(
+            ifd_info(ifd, true),
+            Err(BioFormatsError::InvalidData(message)) if message.contains("expected 768")
+        ));
+    }
+
+    #[test]
+    fn rejects_short_or_oversized_uncompressed_tile_storage() {
+        let fixture = TempTiff::write("raw_tile_bounds", &planar_tiled_tiff());
+
+        let mut short = TiffFileState::open(&fixture.path).unwrap();
+        short.ifds[0].entries.insert(
+            tag::TILE_BYTE_COUNTS,
+            IfdValue::Long(vec![1, 2, 2, 2, 2, 2, 2, 2]),
+        );
+        assert!(matches!(
+            short.read_plane(
+                &PlaneRef {
+                    file_index: 0,
+                    ifd_index: 0,
+                    sub_resolution: 0,
+                },
+                0,
+                0,
+                3,
+                2,
+            ),
+            Err(BioFormatsError::InvalidData(message)) if message.contains("at least 2 bytes")
+        ));
+
+        let mut oversized = TiffFileState::open(&fixture.path).unwrap();
+        oversized.ifds[0].entries.insert(
+            tag::TILE_BYTE_COUNTS,
+            IfdValue::Long(vec![u32::MAX, 2, 2, 2, 2, 2, 2, 2]),
+        );
+        assert!(matches!(
+            oversized.read_plane(
+                &PlaneRef {
+                    file_index: 0,
+                    ifd_index: 0,
+                    sub_resolution: 0,
+                },
+                0,
+                0,
+                3,
+                2,
+            ),
+            Err(BioFormatsError::InvalidData(message)) if message.contains("maximum is 2")
+        ));
+    }
 }

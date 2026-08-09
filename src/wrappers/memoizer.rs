@@ -8,7 +8,7 @@ use crate::common::reader::FormatReader;
 use crate::registry::ImageReader;
 use crate::snapshot::{capture_fingerprint, fingerprint_matches, MemoFilePayload};
 
-const MEMO_VERSION: u32 = 1;
+const MEMO_VERSION: u32 = 2;
 const DEFAULT_MINIMUM_ELAPSED_MS: u64 = 100;
 
 /// Caches initialized reader state to a `.bfmemo` file.
@@ -122,8 +122,13 @@ impl Memoizer {
             return Ok(None);
         }
         let bytes = fs::read(memo_path)?;
-        let mut payload: MemoFilePayload = bincode::deserialize(&bytes)
-            .map_err(|err| BioFormatsError::InvalidData(err.to_string()))?;
+        // Memo files are an internal cache, not source data. An older schema or
+        // otherwise incompatible payload is a cache miss and must never prevent
+        // the source dataset from opening.
+        let Ok(mut payload): std::result::Result<MemoFilePayload, _> = bincode::deserialize(&bytes)
+        else {
+            return Ok(None);
+        };
         if payload.version != MEMO_VERSION || !fingerprint_matches(source_path, &payload.source) {
             return Ok(None);
         }
@@ -183,8 +188,13 @@ impl FormatReader for Memoizer {
         let elapsed = start.elapsed();
         if elapsed >= self.minimum_elapsed {
             if let Some(memo_path) = self.current_memo_file.as_ref() {
-                self.save_memo(path, memo_path)?;
-                self.saved_to_memo = true;
+                match self.save_memo(path, memo_path) {
+                    Ok(()) => self.saved_to_memo = true,
+                    // Memoization is an optimization. Readers that deliberately do not
+                    // implement snapshots must remain usable through this wrapper.
+                    Err(BioFormatsError::SnapshotUnsupported(_)) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(())
@@ -214,6 +224,10 @@ impl FormatReader for Memoizer {
         self.reader.current_file()
     }
 
+    fn used_files(&self) -> Vec<PathBuf> {
+        self.reader.used_files()
+    }
+
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.reader.open_bytes(plane_index)
     }
@@ -239,6 +253,14 @@ impl FormatReader for Memoizer {
 
     fn resolution_count(&self) -> usize {
         self.reader.resolution_count()
+    }
+
+    fn set_flattened_resolutions(&mut self, flattened: bool) -> Result<()> {
+        self.reader.set_flattened_resolutions(flattened)
+    }
+
+    fn flattened_resolutions(&self) -> bool {
+        self.reader.flattened_resolutions()
     }
 
     fn set_resolution(&mut self, level: usize) -> Result<()> {

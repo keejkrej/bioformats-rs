@@ -1,20 +1,25 @@
-//! `bioformats-rs` — direct Rust port of selected Bio-Formats readers.
+//! `bioformats-rs` — native Rust readers ported against Java Bio-Formats.
 //!
 //! Supported formats in this crate:
 //! - TIFF / BigTIFF
 //! - Nikon ND2
 //! - Zeiss CZI
+//! - NRRD
+//! - MRC
+//! - Hamamatsu DCIMG
 //!
 //! ```no_run
-//! use bioformats_rs::ImageReader;
-//! use std::path::Path;
+//! use bioformats_rs::{open, PlaneCoordinates, ReadRequest};
 //!
-//! let mut reader = ImageReader::open(Path::new("image.tif")).unwrap();
-//! let plane = reader.open_bytes(0).unwrap();
-//! assert!(!plane.is_empty());
+//! let dataset = open("image.tif").unwrap();
+//! let plane = dataset
+//!     .read_plane(ReadRequest::new(0, PlaneCoordinates::new(0, 0, 0)))
+//!     .unwrap();
+//! assert!(!plane.bytes().is_empty());
 //! ```
 
 pub mod common;
+pub mod dataset;
 pub mod error;
 pub mod formats;
 pub mod metadata;
@@ -26,6 +31,10 @@ pub mod snapshot;
 pub mod tiff;
 pub mod wrappers;
 
+pub use dataset::{
+    open, Dataset, PixelLayout, Plane, PlaneCoordinates, PlaneInfo, ReadRequest, Rect, Region,
+    Resolution, Series,
+};
 pub use error::{BioFormatsError, Result};
 pub use metadata::{
     ChannelMetadata, DimensionOrder, ImageMetadata, LookupTable, MetadataValue, PlaneMetadata,
@@ -33,7 +42,7 @@ pub use metadata::{
 pub use pattern::{AxisGuesser, AxisType, FilePattern, FilePatternBlock};
 pub use pixel::PixelType;
 pub use reader::FormatReader;
-pub use registry::ImageReader;
+pub use registry::{FormatId, ImageReader, SUPPORTED_FORMATS};
 pub use snapshot::ReaderSnapshot;
 pub use tiff::TiffReader;
 pub use wrappers::{

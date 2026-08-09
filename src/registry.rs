@@ -6,6 +6,62 @@ use crate::common::metadata::ImageMetadata;
 use crate::common::reader::FormatReader;
 use crate::snapshot::ReaderSnapshot;
 
+/// Stable identifier for a built-in reader family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum FormatId {
+    Tiff,
+    Nd2,
+    Czi,
+    Nrrd,
+    Mrc,
+    Dcimg,
+}
+
+impl FormatId {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tiff => "tiff",
+            Self::Nd2 => "nd2",
+            Self::Czi => "czi",
+            Self::Nrrd => "nrrd",
+            Self::Mrc => "mrc",
+            Self::Dcimg => "dcimg",
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Tiff => "TIFF / OME-TIFF",
+            Self::Nd2 => "Nikon NIS-Elements ND2",
+            Self::Czi => "Zeiss CZI",
+            Self::Nrrd => "Nearly Raw Raster Data (NRRD)",
+            Self::Mrc => "Medical Research Council (MRC)",
+            Self::Dcimg => "Hamamatsu DCIMG",
+        }
+    }
+
+    pub const fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::Tiff => &["tif", "tiff", "tf2", "tf8", "btf", "ome"],
+            Self::Nd2 => &["nd2"],
+            Self::Czi => &["czi"],
+            Self::Nrrd => &["nrrd", "nhdr"],
+            Self::Mrc => &["mrc", "st", "ali", "map", "rec", "mrcs"],
+            Self::Dcimg => &["dcimg"],
+        }
+    }
+}
+
+pub const SUPPORTED_FORMATS: &[FormatId] = &[
+    FormatId::Tiff,
+    FormatId::Nd2,
+    FormatId::Czi,
+    FormatId::Nrrd,
+    FormatId::Mrc,
+    FormatId::Dcimg,
+];
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImageReaderSnapshot {
     pub current_path: PathBuf,
@@ -16,14 +72,52 @@ pub struct ImageReaderSnapshot {
 pub struct ImageReader {
     inner: Option<Box<dyn FormatReader>>,
     current_path: Option<PathBuf>,
+    format: Option<FormatId>,
 }
 
-fn all_readers() -> Vec<Box<dyn FormatReader>> {
+fn all_readers() -> Vec<(FormatId, Box<dyn FormatReader>)> {
     vec![
-        Box::new(crate::tiff::TiffReader::new()),
-        Box::new(crate::formats::czi::CziReader::new()),
-        Box::new(crate::formats::nd2::Nd2Reader::new()),
+        (FormatId::Tiff, Box::new(crate::tiff::TiffReader::new())),
+        (
+            FormatId::Czi,
+            Box::new(crate::formats::czi::CziReader::new()),
+        ),
+        (
+            FormatId::Nd2,
+            Box::new(crate::formats::nd2::Nd2Reader::new()),
+        ),
+        (
+            FormatId::Nrrd,
+            Box::new(crate::formats::nrrd::NrrdReader::new()),
+        ),
+        (
+            FormatId::Dcimg,
+            Box::new(crate::formats::dcimg::DcimgReader::new()),
+        ),
+        (
+            FormatId::Mrc,
+            Box::new(crate::formats::mrc::MrcReader::new()),
+        ),
     ]
+}
+
+fn snapshot_format(snapshot: &ReaderSnapshot) -> Option<FormatId> {
+    match snapshot {
+        ReaderSnapshot::TiffReader(_) => Some(FormatId::Tiff),
+        ReaderSnapshot::Nd2Reader(_) => Some(FormatId::Nd2),
+        ReaderSnapshot::CziReader(_) => Some(FormatId::Czi),
+        ReaderSnapshot::ImageReader(snapshot) => snapshot_format(&snapshot.inner),
+        ReaderSnapshot::ChannelSeparator(snapshot) => snapshot_format(&snapshot.inner),
+        ReaderSnapshot::ChannelMerger(snapshot) => snapshot_format(&snapshot.inner),
+        ReaderSnapshot::ChannelFiller(snapshot) => snapshot_format(&snapshot.inner),
+        ReaderSnapshot::DimensionSwapper(snapshot) => snapshot_format(&snapshot.inner),
+        ReaderSnapshot::MinMaxCalculator(snapshot) => snapshot_format(&snapshot.inner),
+        ReaderSnapshot::FileStitcher(snapshot) => snapshot
+            .underlying_readers
+            .first()
+            .and_then(snapshot_format)
+            .or_else(|| snapshot_format(&snapshot.prototype)),
+    }
 }
 
 impl Default for ImageReader {
@@ -37,6 +131,7 @@ impl ImageReader {
         Self {
             inner: None,
             current_path: None,
+            format: None,
         }
     }
 
@@ -47,9 +142,11 @@ impl ImageReader {
     }
 
     pub fn from_snapshot(snapshot: ImageReaderSnapshot) -> Result<Self> {
+        let format = snapshot_format(&snapshot.inner).ok_or(BioFormatsError::NotInitialized)?;
         Ok(Self {
             inner: Some(snapshot.inner.into_reader()?),
             current_path: Some(snapshot.current_path),
+            format: Some(format),
         })
     }
 
@@ -73,8 +170,16 @@ impl ImageReader {
             .metadata()
     }
 
+    pub fn format(&self) -> Option<FormatId> {
+        self.format
+    }
+
     pub fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
         self.inner_mut()?.open_bytes(plane_index)
+    }
+
+    pub fn open_bytes_into(&mut self, plane_index: u32, destination: &mut [u8]) -> Result<usize> {
+        self.inner_mut()?.open_bytes_into(plane_index, destination)
     }
 
     pub fn open_bytes_region(
@@ -86,6 +191,19 @@ impl ImageReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         self.inner_mut()?.open_bytes_region(plane_index, x, y, w, h)
+    }
+
+    pub fn open_bytes_region_into(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        destination: &mut [u8],
+    ) -> Result<usize> {
+        self.inner_mut()?
+            .open_bytes_region_into(plane_index, x, y, w, h, destination)
     }
 
     pub fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {
@@ -144,6 +262,7 @@ impl ImageReader {
         }
         self.inner = None;
         self.current_path = None;
+        self.format = None;
         Ok(())
     }
 }
@@ -152,32 +271,34 @@ impl FormatReader for ImageReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         all_readers()
             .into_iter()
-            .any(|reader| reader.is_this_type_by_name(path))
+            .any(|(_, reader)| reader.is_this_type_by_name(path))
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
         all_readers()
             .into_iter()
-            .any(|reader| reader.is_this_type_by_bytes(header))
+            .any(|(_, reader)| reader.is_this_type_by_bytes(header))
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
-        let header = peek_header(path, 512).unwrap_or_default();
+        let header = peek_header(path, 4096)?;
 
-        for mut reader in all_readers() {
+        for (format, mut reader) in all_readers() {
             if reader.is_this_type_by_bytes(&header) {
                 reader.set_id(path)?;
                 self.inner = Some(reader);
                 self.current_path = Some(path.to_path_buf());
+                self.format = Some(format);
                 return Ok(());
             }
         }
 
-        for mut reader in all_readers() {
+        for (format, mut reader) in all_readers() {
             if reader.is_this_type_by_name(path) {
                 reader.set_id(path)?;
                 self.inner = Some(reader);
                 self.current_path = Some(path.to_path_buf());
+                self.format = Some(format);
                 return Ok(());
             }
         }
@@ -225,6 +346,10 @@ impl FormatReader for ImageReader {
         self.inner_mut()?.open_bytes(plane_index)
     }
 
+    fn open_bytes_into(&mut self, plane_index: u32, destination: &mut [u8]) -> Result<usize> {
+        self.inner_mut()?.open_bytes_into(plane_index, destination)
+    }
+
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
@@ -234,6 +359,19 @@ impl FormatReader for ImageReader {
         h: u32,
     ) -> Result<Vec<u8>> {
         self.inner_mut()?.open_bytes_region(plane_index, x, y, w, h)
+    }
+
+    fn open_bytes_region_into(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        destination: &mut [u8],
+    ) -> Result<usize> {
+        self.inner_mut()?
+            .open_bytes_region_into(plane_index, x, y, w, h, destination)
     }
 
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>> {

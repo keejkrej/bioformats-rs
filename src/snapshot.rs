@@ -130,9 +130,14 @@ pub fn metadata_matches(left: &ImageMetadata, right: &ImageMetadata) -> bool {
         && left.size_c == right.size_c
         && left.size_t == right.size_t
         && left.pixel_type == right.pixel_type
+        && left.bits_per_pixel == right.bits_per_pixel
+        && left.samples_per_pixel == right.samples_per_pixel
         && left.image_count == right.image_count
         && left.dimension_order == right.dimension_order
         && left.is_rgb == right.is_rgb
         && left.is_interleaved == right.is_interleaved
         && left.is_indexed == right.is_indexed
+        && left.is_false_color == right.is_false_color
+        && left.is_little_endian == right.is_little_endian
+        && left.resolution_count == right.resolution_count
 }

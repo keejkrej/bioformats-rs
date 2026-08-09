@@ -1,8 +1,70 @@
 use std::path::{Path, PathBuf};
 
-use crate::common::error::Result;
+use crate::common::error::{BioFormatsError, Result};
 use crate::common::metadata::{ImageMetadata, LookupTable};
 use crate::snapshot::ReaderSnapshot;
+
+/// Validate a requested rectangle before a format reader performs offset math.
+pub(crate) fn validate_region(
+    metadata: &ImageMetadata,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    let Some(right) = x.checked_add(width).filter(|_| width > 0) else {
+        return Err(crate::common::error::BioFormatsError::InvalidRegionShape {
+            x,
+            y,
+            width,
+            height,
+        });
+    };
+    let Some(bottom) = y.checked_add(height).filter(|_| height > 0) else {
+        return Err(crate::common::error::BioFormatsError::InvalidRegionShape {
+            x,
+            y,
+            width,
+            height,
+        });
+    };
+    if right > metadata.size_x || bottom > metadata.size_y {
+        return Err(crate::common::error::BioFormatsError::InvalidRegion {
+            x,
+            y,
+            width,
+            height,
+            image_width: metadata.size_x,
+            image_height: metadata.size_y,
+        });
+    }
+    Ok(())
+}
+
+/// Allocate a zero-filled byte buffer without invoking an infallible capacity growth.
+pub(crate) fn try_zeroed_bytes(length: usize, context: &str) -> Result<Vec<u8>> {
+    if length > isize::MAX as usize {
+        return Err(BioFormatsError::PlaneByteCountOverflow);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(|error| {
+        BioFormatsError::InvalidData(format!(
+            "cannot allocate {context} ({length} bytes): {error}"
+        ))
+    })?;
+    bytes.resize(length, 0);
+    Ok(bytes)
+}
+
+pub(crate) fn destination_prefix(destination: &mut [u8], required: usize) -> Result<&mut [u8]> {
+    if destination.len() < required {
+        return Err(BioFormatsError::BufferTooSmall {
+            required,
+            actual: destination.len(),
+        });
+    }
+    Ok(&mut destination[..required])
+}
 
 /// Core trait implemented by each format reader.
 pub trait FormatReader: Send + Sync {
@@ -74,6 +136,20 @@ pub trait FormatReader: Send + Sync {
         self.metadata().get_zct_coords(index)
     }
     fn open_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>>;
+    /// Decode a full plane into caller storage, returning the written length.
+    ///
+    /// Readers may override this to avoid allocating an intermediate plane.
+    fn open_bytes_into(&mut self, plane_index: u32, destination: &mut [u8]) -> Result<usize> {
+        let bytes = self.open_bytes(plane_index)?;
+        if destination.len() < bytes.len() {
+            return Err(BioFormatsError::BufferTooSmall {
+                required: bytes.len(),
+                actual: destination.len(),
+            });
+        }
+        destination[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
     fn open_bytes_region(
         &mut self,
         plane_index: u32,
@@ -82,6 +158,28 @@ pub trait FormatReader: Send + Sync {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>>;
+    /// Decode an XY region into caller storage, returning the written length.
+    ///
+    /// The default implementation copies from the allocating read path.
+    fn open_bytes_region_into(
+        &mut self,
+        plane_index: u32,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        destination: &mut [u8],
+    ) -> Result<usize> {
+        let bytes = self.open_bytes_region(plane_index, x, y, w, h)?;
+        if destination.len() < bytes.len() {
+            return Err(BioFormatsError::BufferTooSmall {
+                required: bytes.len(),
+                actual: destination.len(),
+            });
+        }
+        destination[..bytes.len()].copy_from_slice(&bytes);
+        Ok(bytes.len())
+    }
     fn open_thumb_bytes(&mut self, plane_index: u32) -> Result<Vec<u8>>;
     fn snapshot(&self) -> Result<ReaderSnapshot> {
         Err(crate::common::error::BioFormatsError::SnapshotUnsupported(
@@ -100,8 +198,17 @@ pub trait FormatReader: Send + Sync {
     fn flattened_resolutions(&self) -> bool {
         true
     }
-    fn set_resolution(&mut self, _level: usize) -> Result<()> {
-        Ok(())
+    fn set_resolution(&mut self, level: usize) -> Result<()> {
+        if level == 0 {
+            Ok(())
+        } else {
+            Err(
+                crate::common::error::BioFormatsError::ResolutionOutOfRange {
+                    series: self.series(),
+                    resolution: level,
+                },
+            )
+        }
     }
     fn resolution(&self) -> usize {
         0

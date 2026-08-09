@@ -38,13 +38,19 @@ impl ChannelSeparator {
         }
 
         let mut metadata = source.clone();
-        metadata.image_count = source.image_count * source.rgb_channel_count();
+        metadata.image_count = source
+            .image_count
+            .saturating_mul(source.samples_per_pixel.max(1));
+        metadata.samples_per_pixel = 1;
         metadata.is_rgb = false;
         metadata.is_interleaved = false;
         metadata.dimension_order = match source.dimension_order {
-            DimensionOrder::XYCTZ | DimensionOrder::XYCZT => source.dimension_order,
-            DimensionOrder::XYTCZ | DimensionOrder::XYTZC => source.dimension_order,
-            DimensionOrder::XYZCT | DimensionOrder::XYZTC => DimensionOrder::XYCZT,
+            DimensionOrder::XYCTZ | DimensionOrder::XYTCZ | DimensionOrder::XYTZC => {
+                DimensionOrder::XYCTZ
+            }
+            DimensionOrder::XYCZT | DimensionOrder::XYZCT | DimensionOrder::XYZTC => {
+                DimensionOrder::XYCZT
+            }
         };
         metadata
     }
@@ -55,7 +61,7 @@ impl ChannelSeparator {
         }
 
         let (z, c, t) = self.metadata.get_zct_coords(no);
-        let source_c = c / self.reader.rgb_channel_count();
+        let source_c = c / self.reader.metadata().samples_per_pixel.max(1);
         self.reader.get_index(z, source_c, t)
     }
 
@@ -133,16 +139,22 @@ impl FormatReader for ChannelSeparator {
         }
 
         let original_index = self.get_original_index(plane_index);
-        let split_channel = self.get_zct_coords(plane_index).1 % self.reader.rgb_channel_count();
+        let samples_per_pixel = self.reader.metadata().samples_per_pixel.max(1);
+        let split_channel = self.get_zct_coords(plane_index).1 % samples_per_pixel;
         let full = self.reader.open_bytes_region(original_index, x, y, w, h)?;
         let bpp = self.metadata.pixel_type.bytes_per_sample();
-        let rgb = self.reader.rgb_channel_count() as usize;
+        let rgb = samples_per_pixel as usize;
         let pixel_count = (w * h) as usize;
         let mut out = vec![0u8; pixel_count * bpp];
         let channel = split_channel as usize;
+        let interleaved = self.reader.is_interleaved();
 
         for pixel in 0..pixel_count {
-            let src = pixel * rgb * bpp + channel * bpp;
+            let src = if interleaved {
+                (pixel * rgb + channel) * bpp
+            } else {
+                (channel * pixel_count + pixel) * bpp
+            };
             let dst = pixel * bpp;
             out[dst..dst + bpp].copy_from_slice(&full[src..src + bpp]);
         }

@@ -123,12 +123,12 @@ impl FileStitcher {
         }
 
         let logical_c = base.effective_size_c().max(1);
-        let rgb = base.rgb_channel_count().max(1);
+        let samples_per_pixel = base.samples_per_pixel.max(1);
         let stitched_logical_c = logical_c.saturating_mul(c_scale);
         let mut metadata = base.clone();
         metadata.size_z = base.size_z.saturating_mul(z_scale);
         metadata.size_t = base.size_t.saturating_mul(t_scale);
-        metadata.size_c = stitched_logical_c.saturating_mul(rgb);
+        metadata.size_c = stitched_logical_c.saturating_mul(samples_per_pixel);
         metadata.image_count = metadata
             .size_z
             .saturating_mul(stitched_logical_c)

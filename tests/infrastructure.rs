@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bioformats_rs::{
     ChannelFiller, DimensionOrder, FilePattern, FileStitcher, FormatReader, ImageMetadata,
@@ -384,6 +384,79 @@ fn memoizer_saves_loads_and_relocates_memo_files() {
     memoizer.set_id(&moved_image).unwrap();
     assert!(memoizer.is_loaded_from_memo());
     assert!(!memoizer.is_saved_to_memo());
+}
+
+#[test]
+fn memoizer_rebuilds_an_incompatible_payload() {
+    let root = temp_dir("memoizer_incompatible");
+    let image_path = root.join("tiny.tif");
+    write_tiny_tiff(&image_path);
+    let memo_path = root.join(".tiny.tif.bfmemo");
+    fs::write(&memo_path, b"not a compatible memo payload").unwrap();
+
+    let mut rebuilt = Memoizer::with_minimum_elapsed(0);
+    rebuilt.set_id(&image_path).unwrap();
+    assert!(!rebuilt.is_loaded_from_memo());
+    assert!(rebuilt.is_saved_to_memo());
+    assert_eq!(rebuilt.open_bytes(0).unwrap(), [7]);
+
+    let mut loaded = Memoizer::with_minimum_elapsed(0);
+    loaded.set_id(&image_path).unwrap();
+    assert!(loaded.is_loaded_from_memo());
+    assert!(!loaded.is_saved_to_memo());
+    assert_eq!(loaded.open_bytes(0).unwrap(), [7]);
+}
+
+#[test]
+fn memoizer_keeps_readers_without_snapshot_support_usable() {
+    let root = temp_dir("memoizer_without_snapshot");
+    let image_path = root.join("synthetic.fake");
+    fs::write(&image_path, []).unwrap();
+
+    let mut metadata = ImageMetadata::default();
+    metadata.size_x = 1;
+    metadata.size_y = 1;
+    let source = GridReader::new(metadata, vec![vec![7]]);
+    let mut memoizer = Memoizer::with_config(source, Duration::ZERO, None);
+
+    memoizer.set_id(&image_path).unwrap();
+    assert!(!memoizer.is_saved_to_memo());
+    assert!(!memoizer.is_loaded_from_memo());
+    assert_eq!(memoizer.open_bytes(0).unwrap(), vec![7]);
+    assert!(!memoizer.memo_file().unwrap().exists());
+}
+
+#[test]
+fn memoizer_preserves_detached_dataset_used_files() {
+    let root = temp_dir("memoizer_detached_nrrd");
+    let raw_path = root.join("pixels.raw");
+    let header_path = root.join("image.nhdr");
+    fs::write(&raw_path, [1_u8, 2, 3, 4]).unwrap();
+    fs::write(
+        &header_path,
+        b"NRRD0005\ntype: uint8\ndimension: 2\nsizes: 2 2\nencoding: raw\ndata file: pixels.raw\n\n",
+    )
+    .unwrap();
+
+    let mut memoizer = Memoizer::with_minimum_elapsed(0);
+    memoizer.set_id(&header_path).unwrap();
+
+    assert_eq!(memoizer.used_files(), [header_path, raw_path]);
+    assert_eq!(memoizer.open_bytes(0).unwrap(), [1, 2, 3, 4]);
+    assert!(!memoizer.is_saved_to_memo());
+}
+
+#[test]
+fn default_resolution_contract_rejects_nonzero_levels() {
+    let metadata = ImageMetadata::default();
+    let mut reader = GridReader::new(metadata, vec![vec![7]]);
+    assert!(matches!(
+        reader.set_resolution(1),
+        Err(bioformats_rs::BioFormatsError::ResolutionOutOfRange {
+            series: 0,
+            resolution: 1
+        })
+    ));
 }
 
 fn find_axis_digit(name: &str, axis: &str) -> Option<u32> {

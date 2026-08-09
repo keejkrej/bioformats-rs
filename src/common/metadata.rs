@@ -114,6 +114,11 @@ pub struct ImageMetadata {
     pub size_t: u32,
     pub pixel_type: PixelType,
     pub bits_per_pixel: u8,
+    /// Number of stored samples returned for each XY pixel.
+    ///
+    /// This is independent of whether those samples represent RGB colour.
+    #[serde(default = "default_samples_per_pixel")]
+    pub samples_per_pixel: u32,
     pub image_count: u32,
     pub dimension_order: DimensionOrder,
     pub is_rgb: bool,
@@ -147,6 +152,7 @@ impl Default for ImageMetadata {
             size_t: 1,
             pixel_type: PixelType::Uint8,
             bits_per_pixel: 8,
+            samples_per_pixel: 1,
             image_count: 1,
             dimension_order: DimensionOrder::XYCZT,
             is_rgb: false,
@@ -174,21 +180,16 @@ impl Default for ImageMetadata {
 
 impl ImageMetadata {
     pub fn effective_size_c(&self) -> u32 {
-        let size_zt = self.size_z.saturating_mul(self.size_t);
-        if size_zt == 0 {
+        let size_zt = u64::from(self.size_z) * u64::from(self.size_t);
+        if size_zt == 0 || u64::from(self.image_count) % size_zt != 0 {
             0
         } else {
-            self.image_count / size_zt
+            u32::try_from(u64::from(self.image_count) / size_zt).unwrap_or(0)
         }
     }
 
     pub fn rgb_channel_count(&self) -> u32 {
-        let effective_c = self.effective_size_c();
-        if effective_c == 0 {
-            0
-        } else {
-            self.size_c / effective_c
-        }
+        self.samples_per_pixel
     }
 
     pub fn logical_channel_count(&self) -> u32 {
@@ -196,8 +197,22 @@ impl ImageMetadata {
     }
 
     pub fn get_index(&self, z: u32, c: u32, t: u32) -> u32 {
-        let dims = [self.size_z, self.logical_channel_count(), self.size_t];
-        let coords = [z, c, t];
+        self.checked_index(z, c, t)
+            .expect("plane coordinates out of range or image dimensions are inconsistent")
+    }
+
+    /// Convert valid logical Z/C/T coordinates to a plane index without overflow.
+    pub fn checked_index(&self, z: u32, c: u32, t: u32) -> Option<u32> {
+        let logical_channels = self.logical_channel_count();
+        if z >= self.size_z || c >= logical_channels || t >= self.size_t {
+            return None;
+        }
+        let dims = [
+            u64::from(self.size_z),
+            u64::from(logical_channels),
+            u64::from(self.size_t),
+        ];
+        let coords = [u64::from(z), u64::from(c), u64::from(t)];
         let (z_pos, c_pos, t_pos) = self.dimension_order.axis_positions();
         let dim_by_pos = match (z_pos, c_pos, t_pos) {
             (2, 3, 4) => [dims[0], dims[1], dims[2]],
@@ -218,13 +233,23 @@ impl ImageMetadata {
             _ => unreachable!("invalid dimension order"),
         };
 
-        coord_by_pos[0]
-            + coord_by_pos[1] * dim_by_pos[0]
-            + coord_by_pos[2] * dim_by_pos[0] * dim_by_pos[1]
+        let index = coord_by_pos[2]
+            .checked_mul(dim_by_pos[0])?
+            .checked_mul(dim_by_pos[1])?
+            .checked_add(coord_by_pos[1].checked_mul(dim_by_pos[0])?)?
+            .checked_add(coord_by_pos[0])?;
+        if index >= u64::from(self.image_count) {
+            return None;
+        }
+        u32::try_from(index).ok()
     }
 
     pub fn get_zct_coords(&self, index: u32) -> (u32, u32, u32) {
-        let dims = [self.size_z, self.logical_channel_count(), self.size_t];
+        let dims = [
+            u64::from(self.size_z),
+            u64::from(self.logical_channel_count()),
+            u64::from(self.size_t),
+        ];
         let (z_pos, c_pos, t_pos) = self.dimension_order.axis_positions();
         let dim_by_pos = match (z_pos, c_pos, t_pos) {
             (2, 3, 4) => [dims[0], dims[1], dims[2]],
@@ -236,11 +261,15 @@ impl ImageMetadata {
             _ => unreachable!("invalid dimension order"),
         };
 
+        if dim_by_pos.contains(&0) {
+            return (0, 0, 0);
+        }
+        let index = u64::from(index);
         let p0 = index % dim_by_pos[0];
         let p1 = (index / dim_by_pos[0]) % dim_by_pos[1];
         let p2 = index / (dim_by_pos[0] * dim_by_pos[1]);
 
-        match (z_pos, c_pos, t_pos) {
+        let (z, c, t) = match (z_pos, c_pos, t_pos) {
             (2, 3, 4) => (p0, p1, p2),
             (2, 4, 3) => (p0, p2, p1),
             (3, 2, 4) => (p1, p0, p2),
@@ -248,6 +277,11 @@ impl ImageMetadata {
             (3, 4, 2) => (p1, p2, p0),
             (4, 3, 2) => (p2, p1, p0),
             _ => unreachable!("invalid dimension order"),
-        }
+        };
+        (z as u32, c as u32, t as u32)
     }
+}
+
+const fn default_samples_per_pixel() -> u32 {
+    1
 }

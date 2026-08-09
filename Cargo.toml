@@ -3,7 +3,7 @@ name = "bioformats-rs"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
-description = "Direct Rust port of selected Bio-Formats readers"
+description = "Embeddable native Rust readers for multidimensional bioimaging formats"
 
 [lib]
 name = "bioformats_rs"
@@ -19,3 +19,6 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 weezl = "0.1"
 zstd = "0.13"
+
+[dev-dependencies]
+sha2 = "0.10"

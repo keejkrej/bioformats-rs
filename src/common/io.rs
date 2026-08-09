@@ -3,8 +3,25 @@ use std::io::{Read, Seek, SeekFrom};
 
 /// Read exactly `n` bytes at a given file offset.
 pub fn read_bytes_at<R: Read + Seek>(r: &mut R, offset: u64, n: usize) -> Result<Vec<u8>> {
+    if n > isize::MAX as usize {
+        return Err(BioFormatsError::PlaneByteCountOverflow);
+    }
+    let length = u64::try_from(n).map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| BioFormatsError::InvalidData("file byte range overflows u64".into()))?;
+    let file_len = r.seek(SeekFrom::End(0))?;
+    if end > file_len {
+        return Err(BioFormatsError::InvalidData(format!(
+            "file byte range {offset}..{end} exceeds file length {file_len}"
+        )));
+    }
     r.seek(SeekFrom::Start(offset))?;
-    let mut buf = vec![0u8; n];
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(n).map_err(|error| {
+        BioFormatsError::InvalidData(format!("cannot allocate {n}-byte file buffer: {error}"))
+    })?;
+    buf.resize(n, 0);
     r.read_exact(&mut buf)?;
     Ok(buf)
 }
@@ -19,7 +36,14 @@ pub fn read_cstring(data: &[u8]) -> String {
 pub fn peek_header(path: &std::path::Path, n: usize) -> Result<Vec<u8>> {
     use std::fs::File;
     let mut f = File::open(path).map_err(BioFormatsError::Io)?;
-    let mut buf = vec![0u8; n];
+    if n > isize::MAX as usize {
+        return Err(BioFormatsError::PlaneByteCountOverflow);
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(n).map_err(|error| {
+        BioFormatsError::InvalidData(format!("cannot allocate {n}-byte header buffer: {error}"))
+    })?;
+    buf.resize(n, 0);
     let read = f.read(&mut buf).map_err(BioFormatsError::Io)?;
     buf.truncate(read);
     Ok(buf)

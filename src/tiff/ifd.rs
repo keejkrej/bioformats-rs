@@ -9,6 +9,7 @@ pub mod tag {
     pub const BITS_PER_SAMPLE: u16 = 258;
     pub const COMPRESSION: u16 = 259;
     pub const PHOTOMETRIC_INTERPRETATION: u16 = 262;
+    pub const FILL_ORDER: u16 = 266;
     pub const IMAGE_DESCRIPTION: u16 = 270;
     pub const STRIP_OFFSETS: u16 = 273;
     pub const SAMPLES_PER_PIXEL: u16 = 277;
@@ -108,6 +109,7 @@ pub enum IfdValue {
     Undefined(Vec<u8>),
     SShort(Vec<i16>),
     SLong(Vec<i32>),
+    SLong8(Vec<i64>),
     SRational(Vec<(i32, i32)>),
     Float(Vec<f32>),
     Double(Vec<f64>),
@@ -127,15 +129,11 @@ impl IfdValue {
     }
 
     pub fn as_u32(&self) -> Option<u32> {
-        self.as_u64().map(|v| v as u32)
+        u32::try_from(self.as_u64()?).ok()
     }
 
     pub fn as_u16(&self) -> Option<u16> {
-        match self {
-            IfdValue::Short(v) if !v.is_empty() => Some(v[0]),
-            IfdValue::Long(v) if !v.is_empty() => Some(v[0] as u16),
-            _ => None,
-        }
+        u16::try_from(self.as_u64()?).ok()
     }
 
     pub fn as_vec_u64(&self) -> Vec<u64> {
@@ -151,14 +149,19 @@ impl IfdValue {
     }
 
     pub fn as_vec_u32(&self) -> Vec<u32> {
-        self.as_vec_u64().into_iter().map(|v| v as u32).collect()
+        self.as_vec_u64()
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap_or_default()
     }
 
     pub fn as_vec_u16(&self) -> Vec<u16> {
-        match self {
-            IfdValue::Short(v) => v.clone(),
-            _ => self.as_vec_u64().into_iter().map(|v| v as u16).collect(),
-        }
+        self.as_vec_u64()
+            .into_iter()
+            .map(u16::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap_or_default()
     }
 
     pub fn as_str(&self) -> Option<&str> {

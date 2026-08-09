@@ -79,6 +79,7 @@ impl ChannelFiller {
 
         let mut metadata = source.clone();
         metadata.size_c = source.size_c.saturating_mul(lut_components);
+        metadata.samples_per_pixel = lut_components;
         metadata.is_indexed = false;
         metadata.is_rgb = lut_components > 1;
         metadata.lookup_table = None;

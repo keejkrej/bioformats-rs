@@ -42,10 +42,18 @@ impl DimensionSwapper {
         self.output_order
     }
 
-    pub fn swap_dimensions(&mut self, order: DimensionOrder) {
+    pub fn swap_dimensions(&mut self, order: DimensionOrder) -> Result<()> {
         let old = self.input_order;
         if old == order {
-            return;
+            return Ok(());
+        }
+
+        let old_c_position = old.axis_positions().1;
+        let new_c_position = order.axis_positions().1;
+        if old_c_position != new_c_position && self.metadata.samples_per_pixel > 1 {
+            return Err(BioFormatsError::InvalidData(
+                "cannot swap the C dimension of multi-sample pixels".into(),
+            ));
         }
 
         let old_meta = self.metadata.clone();
@@ -68,6 +76,7 @@ impl DimensionSwapper {
         self.metadata.size_c = dims[index_of(old_chars, new_chars[3])];
         self.metadata.size_t = dims[index_of(old_chars, new_chars[4])];
         self.input_order = order;
+        Ok(())
     }
 
     pub fn set_output_order(&mut self, order: DimensionOrder) {

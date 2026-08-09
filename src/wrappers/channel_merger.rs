@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
-use crate::common::metadata::ImageMetadata;
+use crate::common::metadata::{DimensionOrder, ImageMetadata};
 use crate::common::reader::FormatReader;
 use crate::wrappers::reader_wrapper::ReaderWrapper;
 use serde::{Deserialize, Serialize};
@@ -29,8 +29,7 @@ impl ChannelMerger {
     }
 
     pub fn can_merge(reader: &dyn FormatReader) -> bool {
-        let size_c = reader.size_c();
-        size_c > 1 && size_c <= 4 && !reader.is_rgb()
+        Self::can_merge_from_metadata(reader.metadata())
     }
 
     fn merged_metadata(source: &ImageMetadata) -> ImageMetadata {
@@ -39,14 +38,28 @@ impl ChannelMerger {
         }
 
         let mut metadata = source.clone();
-        metadata.image_count = source.image_count / source.size_c;
+        let components = source.logical_channel_count();
+        metadata.image_count = source.image_count / components;
+        metadata.samples_per_pixel = components;
         metadata.is_rgb = true;
         metadata.is_interleaved = false;
+        metadata.dimension_order = match source.dimension_order {
+            DimensionOrder::XYCTZ | DimensionOrder::XYTCZ | DimensionOrder::XYTZC => {
+                DimensionOrder::XYCTZ
+            }
+            DimensionOrder::XYCZT | DimensionOrder::XYZCT | DimensionOrder::XYZTC => {
+                DimensionOrder::XYCZT
+            }
+        };
         metadata
     }
 
     fn can_merge_from_metadata(source: &ImageMetadata) -> bool {
-        source.size_c > 1 && source.size_c <= 4 && !source.is_rgb
+        let logical_channels = source.logical_channel_count();
+        source.samples_per_pixel.max(1) == 1
+            && logical_channels > 1
+            && logical_channels <= 4
+            && !source.is_rgb
     }
 
     pub fn from_snapshot(snapshot: ChannelMergerSnapshot) -> Result<Self> {
@@ -124,7 +137,7 @@ impl FormatReader for ChannelMerger {
 
         let (z, _, t) = self.get_zct_coords(plane_index);
         let mut out = Vec::new();
-        for c in 0..self.size_c() {
+        for c in 0..self.metadata.samples_per_pixel {
             let source_index = self.reader.get_index(z, c, t);
             let bytes = self.reader.open_bytes_region(source_index, x, y, w, h)?;
             out.extend_from_slice(&bytes);

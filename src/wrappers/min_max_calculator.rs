@@ -31,7 +31,7 @@ pub struct SeriesStats {
 
 impl SeriesStats {
     fn new(metadata: &ImageMetadata) -> Self {
-        let channels = metadata.rgb_channel_count().max(1) as usize;
+        let channels = metadata.samples_per_pixel.max(1) as usize;
         let plane_count = metadata.image_count as usize;
         Self {
             channel_min: vec![None; channels],
@@ -102,7 +102,7 @@ impl MinMaxCalculator {
     }
 
     pub fn get_channel_global_minimum(&self, channel: usize) -> Result<Option<f64>> {
-        if channel >= self.metadata().rgb_channel_count().max(1) as usize {
+        if channel >= self.metadata().samples_per_pixel.max(1) as usize {
             return Err(BioFormatsError::InvalidData(format!(
                 "Invalid channel index: {}",
                 channel
@@ -115,7 +115,7 @@ impl MinMaxCalculator {
     }
 
     pub fn get_channel_global_maximum(&self, channel: usize) -> Result<Option<f64>> {
-        if channel >= self.metadata().rgb_channel_count().max(1) as usize {
+        if channel >= self.metadata().samples_per_pixel.max(1) as usize {
             return Err(BioFormatsError::InvalidData(format!(
                 "Invalid channel index: {}",
                 channel
@@ -128,7 +128,7 @@ impl MinMaxCalculator {
     }
 
     pub fn get_channel_known_minimum(&self, channel: usize) -> Result<Option<f64>> {
-        if channel >= self.metadata().rgb_channel_count().max(1) as usize {
+        if channel >= self.metadata().samples_per_pixel.max(1) as usize {
             return Err(BioFormatsError::InvalidData(format!(
                 "Invalid channel index: {}",
                 channel
@@ -138,7 +138,7 @@ impl MinMaxCalculator {
     }
 
     pub fn get_channel_known_maximum(&self, channel: usize) -> Result<Option<f64>> {
-        if channel >= self.metadata().rgb_channel_count().max(1) as usize {
+        if channel >= self.metadata().samples_per_pixel.max(1) as usize {
             return Err(BioFormatsError::InvalidData(format!(
                 "Invalid channel index: {}",
                 channel
@@ -250,10 +250,10 @@ impl MinMaxCalculator {
             return Ok(());
         }
 
-        let channel_count = metadata.rgb_channel_count().max(1) as usize;
+        let channel_count = metadata.samples_per_pixel.max(1) as usize;
         let sample_count = bytes.len() / bytes_per_sample;
         let pixels_per_channel = sample_count / channel_count.max(1);
-        let interleaved = metadata.is_rgb && metadata.is_interleaved;
+        let interleaved = metadata.is_interleaved;
 
         let mut local_min = vec![f64::INFINITY; channel_count];
         let mut local_max = vec![f64::NEG_INFINITY; channel_count];

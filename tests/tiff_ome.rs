@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bioformats_rs::ImageReader;
+use bioformats_rs::{open, BioFormatsError, ImageReader, PlaneCoordinates, ReadRequest};
 
 struct TestTiffPage {
     width: u32,
@@ -223,6 +223,46 @@ fn push_tag(out: &mut Vec<u8>, tag: u16, ty: u16, count: u32, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+fn write_rgb_ome_tiff(path: &Path, ome_xml: &str, width: u32, height: u32, pixels: &[u8]) {
+    const TAG_COUNT: u16 = 11;
+    let ifd_size = 2 + usize::from(TAG_COUNT) * 12 + 4;
+    let bits_offset = 8 + ifd_size as u32;
+    let description_offset = bits_offset + 6;
+    let pixel_offset = description_offset + ome_xml.len() as u32 + 1;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(b"II");
+    out.extend_from_slice(&42u16.to_le_bytes());
+    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(&TAG_COUNT.to_le_bytes());
+    push_tag(&mut out, 256, 4, 1, width);
+    push_tag(&mut out, 257, 4, 1, height);
+    push_tag(&mut out, 258, 3, 3, bits_offset);
+    push_tag(&mut out, 259, 3, 1, 1);
+    push_tag(&mut out, 262, 3, 1, 2);
+    push_tag(
+        &mut out,
+        270,
+        2,
+        (ome_xml.len() + 1) as u32,
+        description_offset,
+    );
+    push_tag(&mut out, 273, 4, 1, pixel_offset);
+    push_tag(&mut out, 277, 3, 1, 3);
+    push_tag(&mut out, 278, 4, 1, height);
+    push_tag(&mut out, 279, 4, 1, pixels.len() as u32);
+    push_tag(&mut out, 284, 3, 1, 1);
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.extend_from_slice(ome_xml.as_bytes());
+    out.push(0);
+    out.extend_from_slice(pixels);
+
+    fs::write(path, out).unwrap();
+}
+
 fn pyramid_root_pixels() -> Vec<u8> {
     (1u8..=16).collect()
 }
@@ -281,6 +321,14 @@ fn reads_pyramidal_tiff_flattened_and_unflattened() {
     assert_eq!(hierarchical.metadata().size_x, 2);
     assert_eq!(hierarchical.metadata().size_y, 2);
     assert_eq!(hierarchical.open_bytes(0).unwrap(), pyramid_sub_pixels());
+
+    let dataset = open(&path).unwrap();
+    assert_eq!(dataset.series().len(), 1);
+    assert_eq!(dataset.series()[0].resolutions().len(), 2);
+    let sub_resolution = dataset
+        .read_plane(ReadRequest::new(0, PlaneCoordinates::default()).with_resolution(1))
+        .unwrap();
+    assert_eq!(sub_resolution.bytes(), pyramid_sub_pixels());
 }
 
 #[test]
@@ -294,11 +342,11 @@ fn reads_embedded_ome_tiff_metadata_and_planes() {
   </Instrument>
   <Image ID="Image:0" Name="Series 0">
     <AcquisitionDate>2024-01-02T03:04:05</AcquisitionDate>
-    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="2" SizeZ="1" SizeC="2" SizeT="1" PhysicalSizeX="0.5" PhysicalSizeY="0.6" PhysicalSizeZ="1.5" TimeIncrement="2.0">
-      <Channel ID="Channel:0:0" Name="DAPI" Color="255" EmissionWavelength="450" ExcitationWavelength="405"/>
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SignificantBits="7" SizeX="2" SizeY="2" SizeZ="1" SizeC="2" SizeT="1" PhysicalSizeX="500" PhysicalSizeXUnit="nm" PhysicalSizeY="0.0006" PhysicalSizeYUnit="mm" PhysicalSizeZ="1500" PhysicalSizeZUnit="nm" TimeIncrement="2000" TimeIncrementUnit="ms">
+      <Channel ID="Channel:0:0" Name="DAPI" Color="255" EmissionWavelength="0.45" EmissionWavelengthUnit="µm" ExcitationWavelength="405"/>
       <Channel ID="Channel:0:1" Name="FITC" Color="65280" EmissionWavelength="520" ExcitationWavelength="488"/>
-      <Plane TheZ="0" TheC="0" TheT="0" DeltaT="0.0" PositionX="1.0" PositionY="2.0" PositionZ="3.0"/>
-      <Plane TheZ="0" TheC="1" TheT="0" DeltaT="1.5" PositionX="1.1" PositionY="2.1" PositionZ="3.1"/>
+      <Plane TheZ="0" TheC="0" TheT="0" DeltaT="0.0" DeltaTUnit="ms" PositionX="0.001" PositionXUnit="mm" PositionY="0.002" PositionYUnit="mm" PositionZ="0.003" PositionZUnit="mm"/>
+      <Plane TheZ="0" TheC="1" TheT="0" DeltaT="1500" DeltaTUnit="ms" PositionX="0.0011" PositionXUnit="mm" PositionY="0.0021" PositionYUnit="mm" PositionZ="0.0031" PositionZUnit="mm"/>
       <TiffData IFD="0" PlaneCount="2"/>
     </Pixels>
   </Image>
@@ -333,13 +381,16 @@ fn reads_embedded_ome_tiff_metadata_and_planes() {
     assert_eq!(meta.size_c, 2);
     assert_eq!(meta.size_t, 1);
     assert_eq!(meta.image_count, 2);
+    assert_eq!(meta.bits_per_pixel, 7);
     assert_eq!(meta.channel_metadata.len(), 2);
     assert_eq!(meta.channel_metadata[0].name.as_deref(), Some("DAPI"));
     assert_eq!(meta.channel_metadata[1].name.as_deref(), Some("FITC"));
     assert_eq!(meta.channel_metadata[1].color, Some(65280));
+    assert_eq!(meta.channel_metadata[0].emission_wavelength_nm, Some(450.0));
     assert_eq!(meta.plane_metadata.len(), 2);
     assert_eq!(meta.plane_metadata[1].c, 1);
     assert_eq!(meta.plane_metadata[1].delta_t_seconds, Some(1.5));
+    assert_eq!(meta.plane_metadata[1].position_x_um, Some(1.1));
     assert_eq!(meta.physical_size_x_um, Some(0.5));
     assert_eq!(meta.physical_size_y_um, Some(0.6));
     assert_eq!(meta.physical_size_z_um, Some(1.5));
@@ -354,6 +405,182 @@ fn reads_embedded_ome_tiff_metadata_and_planes() {
 
     assert_eq!(reader.open_bytes(0).unwrap(), vec![1, 2, 3, 4]);
     assert_eq!(reader.open_bytes(1).unwrap(), vec![5, 6, 7, 8]);
+
+    let dataset = open(&path).unwrap();
+    let channel_one = dataset
+        .read_plane(ReadRequest::new(0, PlaneCoordinates::new(0, 1, 0)))
+        .unwrap();
+    assert_eq!(channel_one.bytes(), &[5, 6, 7, 8]);
+}
+
+#[test]
+fn bare_tiff_data_maps_all_consecutive_ifds() {
+    let dir = TempDir::new("implicit_tiff_data");
+    let path = dir.path().join("implicit.ome.tif");
+    let ome_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="2" SizeT="1">
+      <Channel ID="Channel:0:0"/>
+      <Channel ID="Channel:0:1"/>
+      <TiffData/>
+    </Pixels>
+  </Image>
+</OME>"#;
+    write_test_tiff(
+        &path,
+        &[
+            TestTiffPage {
+                width: 2,
+                height: 1,
+                pixels: vec![1, 2],
+                image_description: Some(ome_xml.to_string()),
+                subifd: None,
+            },
+            TestTiffPage {
+                width: 2,
+                height: 1,
+                pixels: vec![3, 4],
+                image_description: None,
+                subifd: None,
+            },
+        ],
+    );
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.metadata().image_count, 2);
+    assert_eq!(reader.open_bytes(0).unwrap(), [1, 2]);
+    assert_eq!(reader.open_bytes(1).unwrap(), [3, 4]);
+}
+
+#[test]
+fn reads_rgb_ome_tiff_as_one_logical_channel_with_three_samples() {
+    let dir = TempDir::new("rgb_ome");
+    let path = dir.path().join("rgb.ome.tif");
+    let ome_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0" Name="RGB">
+    <Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="3" SizeT="1" Interleaved="true">
+      <Channel ID="Channel:0:0" Name="RGB" SamplesPerPixel="3"/>
+      <TiffData IFD="0" PlaneCount="1"/>
+    </Pixels>
+  </Image>
+</OME>"#;
+    let pixels = [1, 2, 3, 4, 5, 6];
+    write_rgb_ome_tiff(&path, ome_xml, 2, 1, &pixels);
+
+    let mut reader = ImageReader::open(&path).unwrap();
+    let metadata = reader.metadata();
+    assert_eq!(metadata.size_c, 3);
+    assert_eq!(metadata.effective_size_c(), 1);
+    assert_eq!(metadata.image_count, 1);
+    assert_eq!(metadata.samples_per_pixel, 3);
+    assert!(metadata.is_rgb);
+    assert!(metadata.is_interleaved);
+    assert_eq!(metadata.channel_metadata.len(), 1);
+    assert_eq!(metadata.channel_metadata[0].name.as_deref(), Some("RGB"));
+    assert_eq!(reader.open_bytes(0).unwrap(), pixels);
+
+    let dataset = open(&path).unwrap();
+    let plane = dataset
+        .read_plane(ReadRequest::new(0, PlaneCoordinates::new(0, 0, 0)))
+        .unwrap();
+    assert_eq!(plane.info().layout.samples_per_pixel, 3);
+    assert_eq!(plane.bytes(), pixels);
+    assert!(dataset
+        .plane_info(ReadRequest::new(0, PlaneCoordinates::new(0, 1, 0)))
+        .is_err());
+}
+
+#[test]
+fn recognized_ome_layout_errors_do_not_fall_back_to_generic_tiff() {
+    let dir = TempDir::new("invalid_rgb_ome");
+    let path = dir.path().join("invalid-rgb.ome.tif");
+    let ome_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0">
+    <Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="3" SizeT="1">
+      <Channel ID="Channel:0:0" SamplesPerPixel="1"/>
+      <TiffData IFD="0" PlaneCount="1"/>
+    </Pixels>
+  </Image>
+</OME>"#;
+    write_rgb_ome_tiff(&path, ome_xml, 2, 1, &[1, 2, 3, 4, 5, 6]);
+
+    assert!(ImageReader::open(&path).is_err());
+    assert!(open(&path).is_err());
+
+    let unknown_type_path = dir.path().join("unknown-type.ome.tif");
+    let unknown_type_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0">
+    <Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="mystery" SizeX="2" SizeY="1" SizeZ="1" SizeC="3" SizeT="1">
+      <Channel ID="Channel:0:0" SamplesPerPixel="3"/>
+      <TiffData IFD="0" PlaneCount="1"/>
+    </Pixels>
+  </Image>
+</OME>"#;
+    write_rgb_ome_tiff(
+        &unknown_type_path,
+        unknown_type_xml,
+        2,
+        1,
+        &[1, 2, 3, 4, 5, 6],
+    );
+
+    assert!(ImageReader::open(&unknown_type_path).is_err());
+    assert!(open(&unknown_type_path).is_err());
+}
+
+#[test]
+fn rejects_malformed_ome_mapping_units_and_significant_bits() {
+    let dir = TempDir::new("invalid_ome_attributes");
+    let pixels = [1, 2, 3, 4, 5, 6];
+
+    let malformed_mapping = dir.path().join("malformed-mapping.ome.tif");
+    write_rgb_ome_tiff(
+        &malformed_mapping,
+        r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="3" SizeT="1">
+    <Channel ID="Channel:0:0" SamplesPerPixel="3"/><TiffData IFD="bad" PlaneCount="1"/>
+  </Pixels></Image>
+</OME>"#,
+        2,
+        1,
+        &pixels,
+    );
+    assert!(ImageReader::open(&malformed_mapping).is_err());
+
+    let reference_frame_position = dir.path().join("reference-frame.ome.tif");
+    write_rgb_ome_tiff(
+        &reference_frame_position,
+        r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SizeX="2" SizeY="1" SizeZ="1" SizeC="3" SizeT="1">
+    <Channel ID="Channel:0:0" SamplesPerPixel="3"/><Plane TheZ="0" TheC="0" TheT="0" PositionX="1"/><TiffData IFD="0" PlaneCount="1"/>
+  </Pixels></Image>
+</OME>"#,
+        2,
+        1,
+        &pixels,
+    );
+    assert!(matches!(
+        ImageReader::open(&reference_frame_position),
+        Err(BioFormatsError::UnsupportedFormat(message)) if message.contains("reference frame")
+    ));
+
+    let invalid_significant_bits = dir.path().join("significant-bits.ome.tif");
+    write_rgb_ome_tiff(
+        &invalid_significant_bits,
+        r#"<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06">
+  <Image ID="Image:0"><Pixels ID="Pixels:0" DimensionOrder="XYCZT" Type="uint8" SignificantBits="9" SizeX="2" SizeY="1" SizeZ="1" SizeC="3" SizeT="1">
+    <Channel ID="Channel:0:0" SamplesPerPixel="3"/><TiffData IFD="0" PlaneCount="1"/>
+  </Pixels></Image>
+</OME>"#,
+        2,
+        1,
+        &pixels,
+    );
+    assert!(ImageReader::open(&invalid_significant_bits).is_err());
 }
 
 #[test]
@@ -361,7 +588,7 @@ fn reads_companion_ome_multifile_mapping_and_used_files() {
     let dir = TempDir::new("companion_ome");
     let plane0 = dir.path().join("plane0.tif");
     let plane1 = dir.path().join("plane1.tif");
-    let companion = dir.path().join("sample.companion.ome");
+    let companion = dir.path().join("sample.ome");
 
     write_test_tiff(
         &plane0,
