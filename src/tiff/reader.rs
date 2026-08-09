@@ -125,6 +125,159 @@ fn try_byte_buffer(capacity: usize, zeroed: bool) -> Result<Vec<u8>> {
     Ok(buffer)
 }
 
+fn checked_packed_row_bytes(
+    width: u32,
+    samples_per_pixel: u16,
+    bits_per_sample: u16,
+) -> Result<usize> {
+    let row_bits = u64::from(width)
+        .checked_mul(u64::from(samples_per_pixel))
+        .and_then(|samples| samples.checked_mul(u64::from(bits_per_sample)))
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    let row_bytes = row_bits
+        .checked_add(7)
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?
+        / 8;
+    checked_storage_len(row_bytes, "packed row byte count")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PackedRegion {
+    row_width: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    rows: u32,
+    samples_per_pixel: u16,
+    bits_per_sample: u16,
+    pixel_type: PixelType,
+    little_endian: bool,
+}
+
+fn unpack_packed_region(packed: &[u8], layout: PackedRegion) -> Result<Vec<u8>> {
+    let bytes_per_sample = match (layout.bits_per_sample, layout.pixel_type) {
+        (1..=7, PixelType::Uint8) => 1,
+        (9..=15, PixelType::Uint16) => 2,
+        _ => {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "TIFF: unpacking {}-bit {:?} samples is not yet supported",
+                layout.bits_per_sample, layout.pixel_type
+            )))
+        }
+    };
+    let region_right = layout.x.checked_add(layout.width).ok_or_else(|| {
+        BioFormatsError::InvalidData("TIFF packed region right edge overflows u32".into())
+    })?;
+    if region_right > layout.row_width {
+        return Err(BioFormatsError::InvalidData(
+            "TIFF packed region exceeds its storage row width".into(),
+        ));
+    }
+
+    let source_row_bytes = checked_packed_row_bytes(
+        layout.row_width,
+        layout.samples_per_pixel,
+        layout.bits_per_sample,
+    )?;
+    let required_source_row_bytes = checked_packed_row_bytes(
+        region_right,
+        layout.samples_per_pixel,
+        layout.bits_per_sample,
+    )?;
+    let required_input_len = if layout.rows == 0 {
+        0
+    } else {
+        checked_index_add(
+            checked_index_mul(
+                checked_index_add(
+                    layout.y as usize,
+                    layout.rows.saturating_sub(1) as usize,
+                    "packed source final row",
+                )?,
+                source_row_bytes,
+                "packed source row offset",
+            )?,
+            required_source_row_bytes,
+            "packed source end",
+        )?
+    };
+    if packed.len() < required_input_len {
+        return Err(BioFormatsError::InvalidData(format!(
+            "TIFF packed rows contain {} bytes; at least {required_input_len} are required",
+            packed.len()
+        )));
+    }
+
+    let output_row_samples =
+        checked_byte_count(&[u64::from(layout.width), u64::from(layout.samples_per_pixel)])?;
+    let output_row_bytes = checked_index_mul(
+        output_row_samples,
+        bytes_per_sample,
+        "unpacked output row byte count",
+    )?;
+    let output_len = checked_index_mul(
+        layout.rows as usize,
+        output_row_bytes,
+        "unpacked row output",
+    )?;
+    let mut output = try_byte_buffer(output_len, true)?;
+    let source_sample_start =
+        checked_byte_count(&[u64::from(layout.x), u64::from(layout.samples_per_pixel)])?;
+
+    for row in 0..layout.rows as usize {
+        let source_row = checked_index_add(layout.y as usize, row, "packed source row")?;
+        let source_row_start =
+            checked_index_mul(source_row, source_row_bytes, "packed source row start")?;
+        let output_row_start =
+            checked_index_mul(row, output_row_bytes, "unpacked output row start")?;
+        for sample in 0..output_row_samples {
+            let source_sample =
+                checked_index_add(source_sample_start, sample, "packed source sample")?;
+            let sample_bit = checked_index_mul(
+                source_sample,
+                layout.bits_per_sample as usize,
+                "packed sample bit offset",
+            )?;
+            let mut value = 0_u16;
+            for bit in 0..layout.bits_per_sample as usize {
+                let bit_index = checked_index_add(sample_bit, bit, "packed bit index")?;
+                let source_index =
+                    checked_index_add(source_row_start, bit_index / 8, "packed source byte index")?;
+                let source = *packed.get(source_index).ok_or_else(|| {
+                    BioFormatsError::InvalidData("TIFF packed sample exceeds decoded data".into())
+                })?;
+                value = (value << 1) | u16::from((source >> (7 - bit_index % 8)) & 1);
+            }
+            let output_offset = checked_index_add(
+                output_row_start,
+                checked_index_mul(sample, bytes_per_sample, "unpacked sample offset")?,
+                "unpacked output sample position",
+            )?;
+            let output_end = checked_index_add(
+                output_offset,
+                bytes_per_sample,
+                "unpacked output sample end",
+            )?;
+            let destination = output.get_mut(output_offset..output_end).ok_or_else(|| {
+                BioFormatsError::InvalidData(
+                    "TIFF unpacked sample exceeds the bounded output buffer".into(),
+                )
+            })?;
+            if bytes_per_sample == 1 {
+                destination[0] = value as u8;
+            } else {
+                let encoded = if layout.little_endian {
+                    value.to_le_bytes()
+                } else {
+                    value.to_be_bytes()
+                };
+                destination.copy_from_slice(&encoded);
+            }
+        }
+    }
+    Ok(output)
+}
+
 #[derive(Debug)]
 struct TiffFileState {
     path: PathBuf,
@@ -925,7 +1078,7 @@ impl TiffFileState {
                 .ok_or_else(|| BioFormatsError::PlaneOutOfRange(plane.ifd_index as u32))?
         };
         let info = ifd_info(ifd, self.parser.little_endian)?;
-        let bytes_per_sample = u64::from(info.bits_per_sample).div_ceil(8);
+        let bytes_per_sample = info.pixel_type.bytes_per_sample() as u64;
         if bytes_per_sample == 0 || info.samples_per_pixel == 0 {
             return Err(BioFormatsError::InvalidData(
                 "TIFF sample width and SamplesPerPixel must be non-zero".into(),
@@ -964,10 +1117,19 @@ impl TiffFileState {
         h: u32,
         plane_byte_len: usize,
     ) -> Result<Vec<u8>> {
-        let bytes_per_sample = u64::from(info.bits_per_sample).div_ceil(8);
+        let bytes_per_sample = info.pixel_type.bytes_per_sample() as u64;
         let stored_spp = u64::from(stored_samples_per_pixel(info));
         let component_planes = stored_component_planes(info);
         let row_bytes = checked_byte_count(&[u64::from(info.width), stored_spp, bytes_per_sample])?;
+        let storage_row_bytes = if info.bits_per_sample.is_multiple_of(8) {
+            row_bytes
+        } else {
+            checked_packed_row_bytes(
+                info.width,
+                stored_samples_per_pixel(info) as u16,
+                info.bits_per_sample,
+            )?
+        };
         let copy_bytes = checked_byte_count(&[u64::from(w), stored_spp, bytes_per_sample])?;
         let rows_per_strip = if info.rows_per_strip == 0 || info.rows_per_strip >= info.height {
             info.height
@@ -1014,8 +1176,9 @@ impl TiffFileState {
                 let strip_rows = strip_end_row - strip_start_row;
                 // A final strip may be encoded at the declared RowsPerStrip
                 // height even though only its in-image rows are copied.
-                let decode_limit = checked_byte_count(&[rows_per_strip.into(), row_bytes as u64])?;
-                let required = checked_byte_count(&[strip_rows.into(), row_bytes as u64])?;
+                let decode_limit =
+                    checked_byte_count(&[rows_per_strip.into(), storage_row_bytes as u64])?;
+                let required = checked_byte_count(&[strip_rows.into(), storage_row_bytes as u64])?;
                 if info.compression == Compression::None
                     && !(required..=decode_limit).contains(&byte_count)
                 {
@@ -1043,9 +1206,37 @@ impl TiffFileState {
                         strip_data.len()
                     )));
                 }
-
                 let first_row = y.max(strip_start_row);
                 let last_row = region_bottom.min(strip_end_row);
+                if !info.bits_per_sample.is_multiple_of(8) {
+                    let strip_region = unpack_packed_region(
+                        &strip_data,
+                        PackedRegion {
+                            row_width: info.width,
+                            x,
+                            y: first_row - strip_start_row,
+                            width: w,
+                            rows: last_row - first_row,
+                            samples_per_pixel: stored_samples_per_pixel(info) as u16,
+                            bits_per_sample: info.bits_per_sample,
+                            pixel_type: info.pixel_type,
+                            little_endian: self.parser.little_endian,
+                        },
+                    )?;
+                    let output_end = checked_index_add(
+                        out.len(),
+                        strip_region.len(),
+                        "packed strip output position",
+                    )?;
+                    if output_end > plane_byte_len {
+                        return Err(BioFormatsError::InvalidData(
+                            "TIFF packed strips exceed the expected plane byte count".into(),
+                        ));
+                    }
+                    out.extend_from_slice(&strip_region);
+                    continue;
+                }
+
                 for source_y in first_row..last_row {
                     let row = (source_y - strip_start_row) as usize;
                     let start = checked_index_add(
@@ -1089,7 +1280,7 @@ impl TiffFileState {
         h: u32,
         plane_byte_len: usize,
     ) -> Result<Vec<u8>> {
-        let bytes_per_sample = u64::from(info.bits_per_sample).div_ceil(8);
+        let bytes_per_sample = info.pixel_type.bytes_per_sample() as u64;
         let stored_spp = u64::from(stored_samples_per_pixel(info));
         let component_planes = stored_component_planes(info);
         if info.tile_width == 0 || info.tile_height == 0 {
@@ -1099,8 +1290,17 @@ impl TiffFileState {
         }
         let tile_row_bytes =
             checked_byte_count(&[u64::from(info.tile_width), stored_spp, bytes_per_sample])?;
-        let tile_data_bytes =
-            checked_byte_count(&[u64::from(info.tile_height), tile_row_bytes as u64])?;
+        let storage_tile_row_bytes = if info.bits_per_sample.is_multiple_of(8) {
+            tile_row_bytes
+        } else {
+            checked_packed_row_bytes(
+                info.tile_width,
+                stored_samples_per_pixel(info) as u16,
+                info.bits_per_sample,
+            )?
+        };
+        let tile_storage_bytes =
+            checked_byte_count(&[u64::from(info.tile_height), storage_tile_row_bytes as u64])?;
         let tiles_across = info.width.div_ceil(info.tile_width);
         let tiles_down = info.height.div_ceil(info.tile_height);
         let tiles_per_component = checked_index_mul(
@@ -1154,9 +1354,9 @@ impl TiffFileState {
                         ))
                     })?;
                     let byte_count = checked_storage_len(byte_count, "tile byte count")?;
-                    if info.compression == Compression::None && byte_count > tile_data_bytes {
+                    if info.compression == Compression::None && byte_count > tile_storage_bytes {
                         return Err(BioFormatsError::InvalidData(format!(
-                            "uncompressed TIFF tile {tile_index} has {byte_count} bytes; maximum is {tile_data_bytes}"
+                            "uncompressed TIFF tile {tile_index} has {byte_count} bytes; maximum is {tile_storage_bytes}"
                         )));
                     }
                     let compressed = read_bytes_at(&mut self.parser.reader, offset, byte_count)?;
@@ -1164,7 +1364,7 @@ impl TiffFileState {
                         &compressed,
                         info.compression,
                         DecompressionOptions {
-                            expected_len: tile_data_bytes,
+                            expected_len: tile_storage_bytes,
                             predictor: info.predictor,
                             samples_per_pixel: stored_spp as u16,
                             bits_per_sample: info.bits_per_sample,
@@ -1181,30 +1381,6 @@ impl TiffFileState {
                     })?;
                     let stored_width = info.width.saturating_sub(tile_x0).min(info.tile_width);
                     let stored_height = info.height.saturating_sub(tile_y0).min(info.tile_height);
-                    let stored_row_bytes = checked_byte_count(&[
-                        u64::from(stored_width),
-                        stored_spp,
-                        bytes_per_sample,
-                    ])?;
-                    let required_tile_bytes = if stored_height == 0 {
-                        0
-                    } else {
-                        checked_index_add(
-                            checked_index_mul(
-                                stored_height.saturating_sub(1) as usize,
-                                tile_row_bytes,
-                                "TIFF stored tile row offset",
-                            )?,
-                            stored_row_bytes,
-                            "TIFF stored tile end",
-                        )?
-                    };
-                    if tile_data.len() < required_tile_bytes {
-                        return Err(BioFormatsError::InvalidData(format!(
-                            "TIFF tile {tile_index} decoded to {} bytes; at least {required_tile_bytes} bytes are required for its in-image pixels",
-                            tile_data.len()
-                        )));
-                    }
                     let copy_x0 = x.max(tile_x0);
                     let copy_y0 = y.max(tile_y0);
                     let copy_x1 = region_right
@@ -1213,18 +1389,91 @@ impl TiffFileState {
                     let copy_y1 = region_bottom
                         .min(tile_y0.saturating_add(info.tile_height))
                         .min(info.height);
-                    let src_x = (copy_x0 - tile_x0) as usize;
-                    let src_y = (copy_y0 - tile_y0) as usize;
                     let dst_x = (copy_x0 - x) as usize;
                     let dst_y = (copy_y0 - y) as usize;
                     let copy_w = (copy_x1 - copy_x0) as usize;
                     let copy_h = (copy_y1 - copy_y0) as usize;
                     let copy_bytes =
                         checked_byte_count(&[copy_w as u64, stored_spp, bytes_per_sample])?;
+                    let (tile_data, source_row_bytes, src_x, src_y) = if info
+                        .bits_per_sample
+                        .is_multiple_of(8)
+                    {
+                        let stored_row_bytes = checked_byte_count(&[
+                            u64::from(stored_width),
+                            stored_spp,
+                            bytes_per_sample,
+                        ])?;
+                        let required_tile_bytes = if stored_height == 0 {
+                            0
+                        } else {
+                            checked_index_add(
+                                checked_index_mul(
+                                    stored_height.saturating_sub(1) as usize,
+                                    tile_row_bytes,
+                                    "TIFF stored tile row offset",
+                                )?,
+                                stored_row_bytes,
+                                "TIFF stored tile end",
+                            )?
+                        };
+                        if tile_data.len() < required_tile_bytes {
+                            return Err(BioFormatsError::InvalidData(format!(
+                                    "TIFF tile {tile_index} decoded to {} bytes; at least {required_tile_bytes} bytes are required for its in-image pixels",
+                                    tile_data.len()
+                                )));
+                        }
+                        (
+                            tile_data,
+                            tile_row_bytes,
+                            (copy_x0 - tile_x0) as usize,
+                            (copy_y0 - tile_y0) as usize,
+                        )
+                    } else {
+                        let stored_row_bytes = checked_packed_row_bytes(
+                            stored_width,
+                            stored_samples_per_pixel(info) as u16,
+                            info.bits_per_sample,
+                        )?;
+                        let required_tile_bytes = if stored_height == 0 {
+                            0
+                        } else {
+                            checked_index_add(
+                                checked_index_mul(
+                                    stored_height.saturating_sub(1) as usize,
+                                    storage_tile_row_bytes,
+                                    "TIFF stored packed tile row offset",
+                                )?,
+                                stored_row_bytes,
+                                "TIFF stored packed tile end",
+                            )?
+                        };
+                        if tile_data.len() < required_tile_bytes {
+                            return Err(BioFormatsError::InvalidData(format!(
+                                    "TIFF packed tile {tile_index} decoded to {} bytes; at least {required_tile_bytes} bytes are required for its in-image pixels",
+                                    tile_data.len()
+                                )));
+                        }
+                        let unpacked = unpack_packed_region(
+                            &tile_data,
+                            PackedRegion {
+                                row_width: info.tile_width,
+                                x: copy_x0 - tile_x0,
+                                y: copy_y0 - tile_y0,
+                                width: copy_x1 - copy_x0,
+                                rows: copy_y1 - copy_y0,
+                                samples_per_pixel: stored_samples_per_pixel(info) as u16,
+                                bits_per_sample: info.bits_per_sample,
+                                pixel_type: info.pixel_type,
+                                little_endian: self.parser.little_endian,
+                            },
+                        )?;
+                        (unpacked, copy_bytes, 0, 0)
+                    };
                     for row in 0..copy_h {
                         let src_row = checked_index_add(src_y, row, "tile source row")?;
                         let src_row_offset =
-                            checked_index_mul(src_row, tile_row_bytes, "tile source row offset")?;
+                            checked_index_mul(src_row, source_row_bytes, "tile source row offset")?;
                         let src_column_offset =
                             checked_byte_count(&[src_x as u64, stored_spp, bytes_per_sample])?;
                         let src_off = checked_index_add(
@@ -1388,6 +1637,13 @@ fn ifd_info(ifd: &Ifd, _little_endian: bool) -> Result<IfdInfo> {
     );
     let compression =
         Compression::from(checked_ifd_u16(ifd, tag::COMPRESSION, "Compression")?.unwrap_or(1));
+    if !bits_per_sample.is_multiple_of(8)
+        && matches!(compression, Compression::Jpeg | Compression::JpegNew)
+    {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "TIFF: JPEG-compressed {bits_per_sample}-bit packed samples are not yet supported"
+        )));
+    }
     let planar_config =
         checked_ifd_u16(ifd, tag::PLANAR_CONFIGURATION, "PlanarConfiguration")?.unwrap_or(1);
     if !matches!(planar_config, 1 | 2) {
@@ -1495,6 +1751,8 @@ fn ifd_info(ifd: &Ifd, _little_endian: bool) -> Result<IfdInfo> {
 
 fn pixel_type_from_bps_format(bps: u16, sample_format: u16) -> Result<PixelType> {
     let pixel_type = match (bps, sample_format) {
+        (1..=7, 1 | 4) => PixelType::Uint8,
+        (9..=15, 1 | 4) => PixelType::Uint16,
         (8, 2) => PixelType::Int8,
         (8, 1 | 4) => PixelType::Uint8,
         (16, 2) => PixelType::Int16,
@@ -1826,6 +2084,7 @@ struct OmeImage {
     size_c_samples: u32,
     size_t: u32,
     pixel_type: PixelType,
+    ome_bit_type: bool,
     significant_bits: u8,
     dimension_order: DimensionOrder,
     channels: Vec<ChannelMetadata>,
@@ -1905,10 +2164,14 @@ fn parse_ome_dataset(
                 "OME pixel type {raw_pixel_type} is not supported"
             ))
         })?;
-        let storage_bits = u32::try_from(pixel_type.bytes_per_sample())
-            .ok()
-            .and_then(|bytes| bytes.checked_mul(8))
-            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        let storage_bits = if raw_pixel_type == "bit" {
+            1
+        } else {
+            u32::try_from(pixel_type.bytes_per_sample())
+                .ok()
+                .and_then(|bytes| bytes.checked_mul(8))
+                .ok_or(BioFormatsError::PlaneByteCountOverflow)?
+        };
         let significant_bits =
             positive_u32_attribute(pixels, "SignificantBits", Some(storage_bits))?;
         if significant_bits > storage_bits {
@@ -2055,6 +2318,7 @@ fn parse_ome_dataset(
             size_c_samples,
             size_t,
             pixel_type,
+            ome_bit_type: raw_pixel_type == "bit",
             significant_bits,
             dimension_order,
             channels,
@@ -2106,6 +2370,8 @@ fn parse_ome_dataset(
 
 fn pixel_type_from_ome(value: &str) -> Option<PixelType> {
     match value {
+        // Packed TIFF bits are exposed as byte-addressable, unscaled scalars.
+        "bit" => Some(PixelType::Uint8),
         "int8" => Some(PixelType::Int8),
         "uint8" => Some(PixelType::Uint8),
         "int16" => Some(PixelType::Int16),
@@ -2382,6 +2648,12 @@ fn build_ome_series(
                 return Err(BioFormatsError::Format(format!(
                     "OME Pixels dimensions {}x{} do not match TIFF IFD dimensions {}x{}",
                     image.size_x, image.size_y, info.width, info.height
+                )));
+            }
+            if image.ome_bit_type && info.bits_per_sample != 1 {
+                return Err(BioFormatsError::Format(format!(
+                    "OME pixel type bit requires TIFF BitsPerSample 1, found {}",
+                    info.bits_per_sample
                 )));
             }
             if info.pixel_type != image.pixel_type {
@@ -2931,13 +3203,60 @@ mod tests {
     }
 
     #[test]
-    fn rejects_tiff_layouts_that_need_unported_sample_transforms() {
+    fn packed_transform_allocates_only_the_requested_scalar_window() {
+        let unpacked = unpack_packed_region(
+            &[0x5a, 0xc0, 0xa5, 0x00, 0xf0, 0x80],
+            PackedRegion {
+                row_width: 10,
+                x: 2,
+                y: 1,
+                width: 3,
+                rows: 1,
+                samples_per_pixel: 1,
+                bits_per_sample: 1,
+                pixel_type: PixelType::Uint8,
+                little_endian: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(unpacked, [1, 0, 0]);
+    }
+
+    #[test]
+    fn accepts_packed_scalars_and_rejects_unported_sample_transforms() {
         let mut packed = baseline_ifd();
         packed
             .entries
             .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![1]));
+        let packed_info = ifd_info(&packed, true).unwrap();
+        assert_eq!(packed_info.pixel_type, PixelType::Uint8);
+        assert_eq!(packed_info.bits_per_sample, 1);
+
+        let mut signed_packed = packed.clone();
+        signed_packed
+            .entries
+            .insert(tag::SAMPLE_FORMAT, IfdValue::Short(vec![2]));
         assert!(matches!(
-            ifd_info(&packed, true),
+            ifd_info(&signed_packed, true),
+            Err(BioFormatsError::UnsupportedFormat(_))
+        ));
+
+        let mut wide_packed = packed.clone();
+        wide_packed
+            .entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![17]));
+        assert!(matches!(
+            ifd_info(&wide_packed, true),
+            Err(BioFormatsError::UnsupportedFormat(_))
+        ));
+
+        let mut reversed_fill_order = packed;
+        reversed_fill_order
+            .entries
+            .insert(tag::FILL_ORDER, IfdValue::Short(vec![2]));
+        assert!(matches!(
+            ifd_info(&reversed_fill_order, true),
             Err(BioFormatsError::UnsupportedFormat(_))
         ));
 

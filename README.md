@@ -34,11 +34,19 @@ assert_eq!(plane.bytes().len(), required_bytes);
 Every read names its series, resolution, Z/C/T coordinates, and region. This
 avoids the mutable selection ordering inherited from Java Bio-Formats and makes
 the same opened dataset safe to share between threads. `plane_info` validates a
-request and reports the required buffer size before I/O. Native bytes are
-returned with an explicit `PixelLayout`, including byte order, significant bits,
-interleaving, and samples per pixel even when the samples are not RGB. Conversion
-to an application's tensor or image model belongs in an adapter owned by that
-application.
+request and reports the required buffer size before I/O. Reader-native scalar
+bytes are returned with an explicit `PixelLayout`, including byte order,
+significant bits, interleaving, and samples per pixel even when the samples are
+not RGB. The layout describes decoded, byte-addressable samples rather than
+source compression or bit packing. TIFF samples stored at unsigned 1–7 or
+9–15-bit widths are expanded without scaling into `Uint8` or `Uint16`
+containers, respectively. Generic TIFF retains the stored width in
+`significant_bits`; OME-TIFF reports its declared significant precision, and
+OME `Type="bit"` requires a one-bit IFD while using the same `Uint8`
+representation. Packed JPEG storage is rejected until its decoder-output
+representation is implemented explicitly.
+Conversion to an application's tensor or image model belongs in an adapter
+owned by that application.
 
 Rows are tightly packed. Interleaved planes use pixel-major samples; planar
 planes store complete sample components consecutively. `read_plane_into` accepts

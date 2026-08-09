@@ -22,7 +22,7 @@ return partially decoded pixels after recognizing a file.
 
 | Family | Java source module | Implemented scope | Verification |
 | --- | --- | --- | --- |
-| TIFF / BigTIFF / OME-TIFF | BSD | Multiple files/series, OME effective-channel/RGB mapping, unit-normalized metadata and SignificantBits, SubIFD pyramids, chunky or planar strips/tiles, raw/LZW/Deflate/PackBits/JPEG/Zstd, horizontal predictor for 8/16-bit samples | Generated default, OME RGB/units, pyramid, planar, endian, malformed-metadata, and overflow tests; packed samples, FillOrder 2, Predictor 3, WhiteIsZero/CMYK, and non-JPEG YCbCr explicitly error; additional real codec corpus needed |
+| TIFF / BigTIFF / OME-TIFF | BSD | Multiple files/series, OME effective-channel/RGB mapping, unit-normalized metadata and SignificantBits, SubIFD pyramids, chunky or planar strips/tiles, raw/LZW/Deflate/PackBits/JPEG/Zstd for byte-aligned samples, horizontal predictor for 8/16-bit samples, and unsigned packed 1–7/9–15-bit samples expanded without scaling into byte-addressable integer containers | Generated default, OME RGB/units/bit, pyramid, planar, endian, every packed width, packed strip/tile/layout/lazy application-source, malformed strip/tile metadata, bounded-codec/transform, and overflow tests; packed JPEG, signed packed samples, and packed widths above 16 remain unsupported, while FillOrder 2, Predictor 3, WhiteIsZero/CMYK, and non-JPEG YCbCr explicitly error; additional real codec corpus needed |
 | Nikon ND2 | GPL | Chunked files, Nikon LV/text metadata, series and plane maps, shared components, raw/zlib pixels, row padding, indexed channel colors/LUTs, and root-scoped atomic acquisition reconciliation | Eight public fixtures cover scalar/indexed, shared C3, zlib, padded Z/T, NETime, planned spectral loops, stale/final metadata, and binary LV metadata against Java 8.3/8.5; JPEG 2000 explicitly unsupported |
 | Zeiss CZI | GPL | Scenes and other series axes, both split-file naming forms, full-resolution subblocks, typed XML metadata; raw/JPEG/LZW/Zstd-0/Zstd-1 decode paths are implemented, with compressed paths not yet real-fixture verified | Public idr0011 metadata, three planes, and region match Java Bio-Formats 8.3; pyramid blocks are skipped, heterogeneous selected pixel types and non-singleton R/I/H axes fail rather than being collapsed, and per-channel LUTs, JPEG-XR, and complex pixels remain unsupported |
 | NRRD | BSD | Inline or detached raw/gzip data, scalar/vector dimensions, endian and byte-skip handling | Public `dt-helix` metadata, three planes, and region match Java Bio-Formats 8.3 |
@@ -54,7 +54,19 @@ plane for raw or gzip NRRD, MRC, and DCIMG data; other readers may still require
 temporary storage for codecs or whole-plane transforms. `FormatReader`,
 wrappers, and snapshots are lower-level implementation machinery.
 
-Pixel conversion is intentionally not part of this crate. An application such
+TIFF bit unpacking is a reader storage transform rather than an application
+pixel conversion: unsigned 1–7-bit values are returned unscaled in `Uint8`, and
+9–15-bit values in `Uint16`. Generic TIFF retains the stored width as
+significant-bit metadata; OME-TIFF reports its declared significant precision,
+and OME `Type="bit"` requires a one-bit IFD while resolving to the same
+byte-addressable `Uint8` layout. Source row padding and bit order do not leak
+through `PixelLayout`, and an interior read expands only its requested scalar
+window after bounded packed-byte decompression. Packed JPEG, signed packed
+samples, and widths above 16 remain structured unsupported errors because
+current decoder/Java behavior does not provide a sound parity representation
+for them.
+
+Pixel conversion is otherwise intentionally not part of this crate. An application such
 as `image-rs` can decide whether to preserve native integer samples, normalize
 to `f32`, lazily page planes, or eagerly materialize an entire tensor. Keeping
 that policy in the application avoids forcing every integrator into the same

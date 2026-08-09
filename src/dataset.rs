@@ -137,7 +137,12 @@ impl ReadRequest {
     }
 }
 
-/// Storage layout of the returned native samples.
+/// Storage layout of the returned native scalar samples.
+///
+/// This describes decoded bytes returned by the reader, not compression or
+/// bit-packing in the source file. A reader may expand packed source samples
+/// into the smallest byte-addressable integer container while preserving their
+/// original precision in `significant_bits`.
 ///
 /// Rows are tightly packed with no padding. When `interleaved` is true, the
 /// byte offset for sample `s` of pixel `(x, y)` is
