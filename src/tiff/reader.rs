@@ -1800,31 +1800,48 @@ fn build_generic_series(
         .first()
         .ok_or_else(|| BioFormatsError::Format("missing TIFF file".into()))?;
     let little_endian = file.parser.little_endian;
-    let infos = file
-        .ifds
-        .iter()
-        .enumerate()
-        .map(|(index, ifd)| ifd_info(ifd, little_endian).map(|info| (index, info)))
-        .collect::<Result<Vec<_>>>()?;
+    let mut infos = Vec::new();
+    let exclude_reduced_images = file.ifds.len() > 1;
+    for (index, ifd) in file.ifds.iter().enumerate() {
+        let subfile_type =
+            checked_ifd_u32(ifd, tag::NEW_SUBFILE_TYPE, "NewSubfileType")?.unwrap_or(0);
+        if exclude_reduced_images && subfile_type == 1 {
+            // MinimalTiffReader reserves reduced-image main IFDs as
+            // thumbnails instead of exposing them as pixel series.
+            continue;
+        }
+        infos.push((index, ifd_info(ifd, little_endian)?));
+    }
     if infos.is_empty() {
-        return Ok(Vec::new());
+        return Err(BioFormatsError::InvalidData(
+            "TIFF contains no full-resolution primary IFDs".into(),
+        ));
     }
 
-    let mut groups: Vec<Vec<(usize, IfdInfo)>> = Vec::new();
-    for (index, info) in infos {
-        if let Some(last) = groups.last_mut() {
-            let previous = &last.last().unwrap().1;
-            if same_plane_layout(previous, &info) {
-                last.push((index, info));
-                continue;
-            }
-        }
-        groups.push(vec![(index, info)]);
-    }
+    // Java checks every retained IFD against the first using only dimensions
+    // and scalar pixel type. Rust additionally requires one fixed sample
+    // layout per series so every plane agrees with its advertised byte count,
+    // interleaving, and lookup table. If any page differs, every page becomes
+    // its own series (rather than preserving runs of adjacent compatible
+    // pages).
+    let imagej_comment = imagej_comment_for_ifds(file, infos[0].0, infos[infos.len() - 1].0);
+    let first_layout = &infos[0].1;
+    let separate_series = infos.iter().skip(1).any(|(_, info)| {
+        info.width != first_layout.width
+            || info.height != first_layout.height
+            || info.pixel_type != first_layout.pixel_type
+            || !same_plane_layout(info, first_layout)
+    });
+    let groups = if separate_series {
+        infos.into_iter().map(|info| vec![info]).collect()
+    } else {
+        vec![infos]
+    };
 
     groups
         .into_iter()
-        .map(|group| {
+        .enumerate()
+        .map(|(series_index, group)| {
             let first = &group[0].1;
             let plane_refs = group
                 .iter()
@@ -1834,14 +1851,23 @@ fn build_generic_series(
                     sub_resolution: 0,
                 })
                 .collect::<Vec<_>>();
-            let mut metadata =
-                generic_metadata_from_info(first, plane_refs.len() as u32, used_files);
+            let image_count = u32::try_from(plane_refs.len()).map_err(|_| {
+                BioFormatsError::InvalidData("TIFF series plane count exceeds u32".into())
+            })?;
+            let mut metadata = generic_metadata_from_info(first, image_count, used_files);
             apply_standard_tiff_metadata(
                 &mut metadata,
                 &file.ifds[group[0].0],
                 first,
                 little_endian,
             )?;
+            // TiffReader parses only the retained dataset's global first or
+            // last comment and applies the result to core series zero.
+            if series_index == 0 {
+                if let Some(comment) = &imagej_comment {
+                    apply_imagej_metadata(&mut metadata, image_count, comment);
+                }
+            }
             let resolutions = build_resolution_levels(minimal, plane_refs, metadata.clone())?;
             metadata = resolutions[0].metadata.clone();
             Ok(SeriesData {
@@ -1863,18 +1889,21 @@ fn generic_metadata_from_info(
     let mut metadata = ImageMetadata {
         size_x: info.width,
         size_y: info.height,
-        size_z: image_count,
+        // Java MinimalTiffReader treats a compatible multipage TIFF as a
+        // time series until a format-specific comment supplies stronger ZCT
+        // information.
+        size_z: 1,
         size_c: if is_rgb {
             info.samples_per_pixel as u32
         } else {
             1
         },
-        size_t: 1,
+        size_t: image_count,
         pixel_type: info.pixel_type,
         bits_per_pixel: info.bits_per_sample as u8,
         samples_per_pixel: returned_samples_per_pixel(info),
         image_count,
-        dimension_order: DimensionOrder::XYZTC,
+        dimension_order: DimensionOrder::XYCZT,
         is_rgb,
         is_interleaved: info.planar_config == 1,
         is_indexed,
@@ -1899,6 +1928,220 @@ fn generic_metadata_from_info(
         );
     }
     metadata
+}
+
+fn imagej_comment_for_ifds(
+    file: &TiffFileState,
+    first_index: usize,
+    last_index: usize,
+) -> Option<String> {
+    let first_ifd = file.ifds.get(first_index)?;
+    let first_comment = first_ifd.get_str(tag::IMAGE_DESCRIPTION);
+    let last_comment = file
+        .ifds
+        .get(last_index)
+        .and_then(|ifd| ifd.get_str(tag::IMAGE_DESCRIPTION));
+    let mut comment = first_comment
+        .filter(|comment| comment.starts_with("ImageJ="))
+        .or_else(|| last_comment.filter(|comment| comment.starts_with("ImageJ=")))?
+        .to_owned();
+
+    if let Some(extra) = first_ifd
+        .get(tag::IMAGEJ_METADATA)
+        .and_then(imagej_text_value)
+        .filter(|extra| !extra.is_empty())
+    {
+        comment.push('\n');
+        comment.push_str(&extra);
+    }
+    Some(normalize_tiff_text(&comment))
+}
+
+fn normalize_tiff_text(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn imagej_text_value(value: &IfdValue) -> Option<String> {
+    match value {
+        IfdValue::Ascii(value) => Some(normalize_tiff_text(value)),
+        IfdValue::Byte(values) => Some(imagej_numeric_text(values.iter().copied().map(u32::from))),
+        IfdValue::Short(values) => Some(imagej_numeric_text(values.iter().copied().map(u32::from))),
+        IfdValue::SByte(values) => Some(imagej_numeric_text(
+            values.iter().copied().map(|value| u32::from(value as u8)),
+        )),
+        _ => None,
+    }
+}
+
+fn imagej_numeric_text(values: impl IntoIterator<Item = u32>) -> String {
+    values
+        .into_iter()
+        .filter_map(|value| {
+            let character = char::from_u32(value)?;
+            if character == '\0' {
+                None
+            } else if character.is_control() {
+                Some('\n')
+            } else {
+                Some(character)
+            }
+        })
+        .collect()
+}
+
+fn parse_imagej_u32(value: &str) -> u32 {
+    value.parse().unwrap_or(0)
+}
+
+fn parse_imagej_f64(value: &str) -> f64 {
+    // Java Double.parseDouble accepts surrounding ASCII whitespace, unlike
+    // Integer.parseInt (used for ImageJ axis sizes and origins).
+    value.trim().parse().unwrap_or(0.0)
+}
+
+fn imagej_length_factor_um(unit: &str) -> Option<f64> {
+    let unit = unit.trim();
+    match unit.to_ascii_lowercase().as_str() {
+        "micron" | "microns" | "micrometer" | "micrometers" => Some(1.0),
+        "nanometer" | "nanometers" => Some(1e-3),
+        "millimeter" | "millimeters" => Some(1e3),
+        "centimeter" | "centimeters" => Some(1e4),
+        "meter" | "meters" => Some(1e6),
+        "inch" | "inches" => Some(25_400.0),
+        _ => length_factor_um(unit),
+    }
+}
+
+fn checked_imagej_product(factors: &[u32]) -> Option<u32> {
+    factors
+        .iter()
+        .try_fold(1_u32, |product, factor| product.checked_mul(*factor))
+}
+
+fn apply_imagej_metadata(metadata: &mut ImageMetadata, plane_count: u32, comment: &str) {
+    let base_size_c = metadata.size_c;
+    let mut size_z = 1;
+    let mut size_c = base_size_c;
+    let mut size_t = 1;
+
+    if let Some(first_line) = comment.lines().next() {
+        if let Some(version) = first_line.strip_prefix("ImageJ=") {
+            metadata.series_metadata.insert(
+                "ImageJ".into(),
+                MetadataValue::String(version.trim().to_owned()),
+            );
+        }
+    }
+
+    for token in comment.lines() {
+        let Some((raw_key, raw_value)) = token.split_once('=') else {
+            continue;
+        };
+        // Java dispatches known ImageJ fields with raw startsWith checks. In
+        // particular, whitespace around '=' makes a dimension field generic
+        // metadata rather than a semantic axis declaration.
+        match raw_key {
+            "ImageJ" => {}
+            "channels" => size_c = parse_imagej_u32(raw_value),
+            "slices" => size_z = parse_imagej_u32(raw_value),
+            "frames" => size_t = parse_imagej_u32(raw_value),
+            // Java only uses this field for its missing-IFD repair path.
+            "images" => {}
+            "mode" => {
+                metadata.series_metadata.insert(
+                    "Color mode".into(),
+                    MetadataValue::String(raw_value.trim().to_owned()),
+                );
+            }
+            "unit" => {
+                metadata.series_metadata.insert(
+                    "Unit".into(),
+                    MetadataValue::String(raw_value.trim().to_owned()),
+                );
+            }
+            "finterval" => {
+                let interval = parse_imagej_f64(raw_value);
+                metadata
+                    .series_metadata
+                    .insert("Frame Interval".into(), MetadataValue::Float(interval));
+                // Java's primitive parser returns 0 for malformed values and
+                // retains negative intervals as written.
+                metadata.time_increment_seconds = Some(interval);
+            }
+            "spacing" => {
+                let spacing = parse_imagej_f64(raw_value);
+                metadata
+                    .series_metadata
+                    .insert("Spacing".into(), MetadataValue::Float(spacing));
+                let spacing = spacing.abs();
+                metadata.physical_size_z_um = if spacing.is_finite() && spacing > 0.0 {
+                    // Java Bio-Formats records ImageJ spacing in micrometres,
+                    // independently of the comment's XY calibration unit.
+                    Some(spacing)
+                } else {
+                    None
+                };
+            }
+            "xorigin" | "yorigin" => {
+                let origin = i64::from(raw_value.parse::<i32>().unwrap_or(0));
+                let name = if raw_key == "xorigin" {
+                    "X Origin"
+                } else {
+                    "Y Origin"
+                };
+                metadata
+                    .series_metadata
+                    .insert(name.into(), MetadataValue::Int(origin));
+            }
+            _ if !raw_key.trim().is_empty() => {
+                metadata.series_metadata.insert(
+                    raw_key.trim().to_owned(),
+                    MetadataValue::String(raw_value.trim().to_owned()),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Match TiffReader.parseCommentImageJ. ImageJ stores C fastest, then Z,
+    // then T. RGB samples live inside each IFD and ordinarily do not consume
+    // an additional logical C plane.
+    let is_rgb = metadata.is_rgb;
+    if is_rgb && checked_imagej_product(&[size_z, size_c, size_t]) == Some(size_c) {
+        size_t = plane_count;
+    }
+    let logical_channels = if is_rgb { 1 } else { size_c };
+    if checked_imagej_product(&[size_z, size_t, logical_channels]) == Some(plane_count) {
+        metadata.size_z = size_z;
+        metadata.size_t = size_t;
+        metadata.size_c = if is_rgb { base_size_c } else { size_c };
+    } else if is_rgb && checked_imagej_product(&[size_z, size_c, size_t]) == Some(plane_count) {
+        if let Some(total_samples) = base_size_c.checked_mul(size_c) {
+            metadata.size_z = size_z;
+            metadata.size_t = size_t;
+            metadata.size_c = total_samples;
+        }
+    }
+    metadata.dimension_order = DimensionOrder::XYCZT;
+    metadata.image_count = plane_count;
+}
+
+fn resolution_unit_from_comment(comment: &str) -> Option<&str> {
+    // Mirrors BaseTiffReader's greedy `(.*)unit=(\w+)(.*)` lookup: use the
+    // final valid occurrence and consume Java-regex ASCII word characters.
+    for (index, _) in comment.rmatch_indices("unit=") {
+        let suffix = &comment[index + "unit=".len()..];
+        let Some(end) = suffix
+            .char_indices()
+            .take_while(|(_, character)| character.is_ascii_alphanumeric() || *character == '_')
+            .map(|(index, character)| index + character.len_utf8())
+            .last()
+        else {
+            continue;
+        };
+        return Some(&suffix[..end]);
+    }
+    None
 }
 
 fn apply_standard_tiff_metadata(
@@ -1927,6 +2170,17 @@ fn apply_standard_tiff_metadata(
         3 => 10_000.0,
         _ => 1.0,
     };
+    // Java only extracts the XY calibration unit from the first IFD comment;
+    // an ImageJ comment found on the final IFD still controls ZCT/spacing/time
+    // but must not reinterpret the first IFD's X/Y resolution tags.
+    let comment_unit_multiplier = if resolution_unit == 3 {
+        1.0
+    } else {
+        ifd.get_str(tag::IMAGE_DESCRIPTION)
+            .and_then(resolution_unit_from_comment)
+            .and_then(imagej_length_factor_um)
+            .unwrap_or(1.0)
+    };
     metadata.series_metadata.insert(
         "ResolutionUnit".into(),
         MetadataValue::Int(i64::from(resolution_unit)),
@@ -1936,7 +2190,8 @@ fn apply_standard_tiff_metadata(
             .series_metadata
             .insert("XResolution".into(), MetadataValue::Float(resolution));
         if resolution > 0.0 {
-            metadata.physical_size_x_um = Some(resolution_multiplier_um / resolution);
+            metadata.physical_size_x_um =
+                Some(resolution_multiplier_um / resolution * comment_unit_multiplier);
         }
     }
     if let Some(resolution) = rational_to_f64(ifd.get(tag::Y_RESOLUTION)) {
@@ -1944,7 +2199,8 @@ fn apply_standard_tiff_metadata(
             .series_metadata
             .insert("YResolution".into(), MetadataValue::Float(resolution));
         if resolution > 0.0 {
-            metadata.physical_size_y_um = Some(resolution_multiplier_um / resolution);
+            metadata.physical_size_y_um =
+                Some(resolution_multiplier_um / resolution * comment_unit_multiplier);
         }
     }
     metadata.is_little_endian = little_endian;
@@ -3336,6 +3592,36 @@ mod tests {
     }
 
     #[test]
+    fn imagej_rgb_hyperstack_separates_samples_from_logical_channels() {
+        let mut ifd = baseline_ifd();
+        ifd.entries
+            .insert(tag::BITS_PER_SAMPLE, IfdValue::Short(vec![8, 8, 8]));
+        ifd.entries
+            .insert(tag::SAMPLES_PER_PIXEL, IfdValue::Short(vec![3]));
+        ifd.entries.insert(
+            tag::PHOTOMETRIC_INTERPRETATION,
+            IfdValue::Short(vec![Photometric::Rgb as u16]),
+        );
+        let info = ifd_info(&ifd, true).unwrap();
+        let mut metadata = generic_metadata_from_info(&info, 12, &[]);
+
+        apply_imagej_metadata(
+            &mut metadata,
+            12,
+            "ImageJ=1.54\nchannels=2\nslices=3\nframes=2",
+        );
+
+        assert_eq!(
+            (metadata.size_z, metadata.size_c, metadata.size_t),
+            (3, 6, 2)
+        );
+        assert_eq!(metadata.samples_per_pixel, 3);
+        assert_eq!(metadata.logical_channel_count(), 2);
+        assert_eq!(metadata.get_index(2, 1, 1), 11);
+        assert_eq!(metadata.get_zct_coords(8), (1, 0, 1));
+    }
+
+    #[test]
     fn standard_tiff_resolution_uses_declared_units() {
         for (unit, expected_x_um) in [(1_u16, 0.01), (2, 254.0), (3, 100.0)] {
             let mut ifd = baseline_ifd();
@@ -3352,6 +3638,46 @@ mod tests {
                 Some(MetadataValue::Int(value)) if *value == i64::from(unit)
             ));
         }
+    }
+
+    #[test]
+    fn last_ifd_imagej_fields_do_not_reinterpret_first_ifd_xy_calibration() {
+        let mut ifd = baseline_ifd();
+        ifd.entries
+            .insert(tag::X_RESOLUTION, IfdValue::Rational(vec![(4, 1)]));
+        ifd.entries.insert(
+            tag::IMAGE_DESCRIPTION,
+            IfdValue::Ascii("ordinary first-page comment".into()),
+        );
+        let info = ifd_info(&ifd, true).unwrap();
+        let mut metadata = generic_metadata_from_info(&info, 4, &[]);
+        apply_standard_tiff_metadata(&mut metadata, &ifd, &info, true).unwrap();
+
+        apply_imagej_metadata(&mut metadata, 4, "ImageJ=1.54\nunit=nm\nfinterval=-2.5");
+
+        // BaseTiffReader consults only the first IFD comment for the X/Y unit,
+        // while TiffReader may source dimensions/timing from the final IFD.
+        assert_eq!(metadata.physical_size_x_um, Some(0.25));
+        assert_eq!(metadata.time_increment_seconds, Some(-2.5));
+
+        apply_imagej_metadata(&mut metadata, 4, "ImageJ=1.54\nfinterval=malformed");
+        assert_eq!(metadata.time_increment_seconds, Some(0.0));
+
+        let mut whitespace_axes = generic_metadata_from_info(&info, 4, &[]);
+        apply_imagej_metadata(
+            &mut whitespace_axes,
+            4,
+            "ImageJ=1.54\nimages=4\nchannels= 2\nslices=2\nframes=1",
+        );
+        assert_eq!(
+            (
+                whitespace_axes.size_z,
+                whitespace_axes.size_c,
+                whitespace_axes.size_t,
+            ),
+            (1, 1, 4)
+        );
+        assert!(!whitespace_axes.series_metadata.contains_key("Images"));
     }
 
     #[test]

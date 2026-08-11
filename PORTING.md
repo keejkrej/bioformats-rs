@@ -22,7 +22,7 @@ return partially decoded pixels after recognizing a file.
 
 | Family | Java source module | Implemented scope | Verification |
 | --- | --- | --- | --- |
-| TIFF / BigTIFF / OME-TIFF | BSD | Multiple files/series, OME effective-channel/RGB mapping, unit-normalized metadata and SignificantBits, SubIFD pyramids, chunky or planar strips/tiles, raw/LZW/Deflate/PackBits/JPEG/Zstd for byte-aligned samples, horizontal predictor for 8/16-bit samples, and unsigned packed 1–7/9–15-bit samples expanded without scaling into byte-addressable integer containers | Generated default, OME RGB/units/bit, pyramid, planar, endian, every packed width, packed strip/tile/layout/lazy application-source, malformed strip/tile metadata, bounded-codec/transform, and overflow tests; packed JPEG, signed packed samples, and packed widths above 16 remain unsupported, while FillOrder 2, Predictor 3, WhiteIsZero/CMYK, and non-JPEG YCbCr explicitly error; additional real codec corpus needed |
+| TIFF / BigTIFF / OME-TIFF | BSD | Multiple files/series, Java-compatible generic time stacks and heterogeneous-primary splitting, ImageJ scalar/RGB C/Z/T hyperstacks and calibration, OME effective-channel/RGB mapping, unit-normalized metadata and SignificantBits, SubIFD pyramids, chunky or planar strips/tiles, raw/LZW/Deflate/PackBits/JPEG/Zstd for byte-aligned samples, horizontal predictor for 8/16-bit samples, and unsigned packed 1–7/9–15-bit samples expanded without scaling into byte-addressable integer containers | Generated generic and scalar ImageJ stack metadata match Java 8.5 directly for default axes, C/Z/T, and physical/time calibration; native regressions additionally cover both RGB axis branches, strict global first/last comments, mismatch fallback, heterogeneous and incompatible-sample series, reduced-image exclusion, planes, and regions. Generated default, OME RGB/units/bit, pyramid, planar, endian, every packed width, packed strip/tile/layout/lazy application-source, malformed strip/tile metadata, bounded-codec/transform, and overflow tests also pass; legacy missing-IFD raw-tail repair, packed JPEG, signed packed samples, and packed widths above 16 remain unsupported, while FillOrder 2, Predictor 3, WhiteIsZero/CMYK, and non-JPEG YCbCr explicitly error; additional real codec corpus needed |
 | Nikon ND2 | GPL | Chunked files, Nikon LV/text metadata, series and plane maps, shared components, raw/zlib pixels, row padding, indexed channel colors/LUTs, and root-scoped atomic acquisition reconciliation | Eight public fixtures cover scalar/indexed, shared C3, zlib, padded Z/T, NETime, planned spectral loops, stale/final metadata, and binary LV metadata against Java 8.3/8.5; JPEG 2000 explicitly unsupported |
 | Zeiss CZI | GPL | Scenes and other series axes, both split-file naming forms, typed XML metadata, first same-part Label/SlidePreview embedded-CZI attachments, and raw/JPEG/JPEG-XR/LZW/Zstd-0/Zstd-1 subblocks; mosaic tiles and integer-scaled pyramid levels are assembled from logical coordinates while stored dimensions govern decoding, including sparse fill, rounded edge clipping, and intersection-only region reads | Public idr0011 metadata, three planes, and region match Java Bio-Formats 8.3; public `Zeiss-5-Cropped` JPEG-XR pyramid dimensions, selected full planes, native-resolution region, and default attachment series match 8.5; generated Java-readable mosaics cover factor-2/factor-3 levels, negative origins, missing tiles/planes, sparse independent M series, RGB fill/BGR conversion, rounded edges, snapshots, and bounded tile selection; LZW/Zstd pyramids still need real-vendor verification, while per-channel LUTs, complex pixels, incompatible heterogeneous layouts, cross-part and other attachment types, and non-singleton R/I/H axes remain unsupported |
 | NRRD | BSD | Inline or detached raw/gzip data, scalar/vector dimensions, endian and byte-skip handling | Public `dt-helix` metadata, three planes, and region match Java Bio-Formats 8.3 |
@@ -49,20 +49,19 @@ Within the six implemented families, the remaining CZI gaps are non-singleton
 R/I/H axes, channel LUTs, incompatible heterogeneous pixel layouts, cross-part
 attachment references and types beyond the first Label/SlidePreview images,
 and broader real-vendor coverage of non-JPEG-XR pyramids. ND2 still lacks JPEG
-2000. Generic TIFF also lacks Java's ImageJ hyperstack parsing and currently
-maps same-layout pages along Z, whereas Java's minimal TIFF default maps them
-along T; the remaining TIFF codec and transform limitations are listed in the
-matrix above. The metadata surface is intentionally focused on pixels,
-dimensions, channels, physical sizes, acquisition timing, and selected
-annotations rather than Java Bio-Formats' full OME metadata graph and
-service/plugin APIs.
+2000. Generic TIFF does not implement Java's risky legacy repair that invents
+missing IFDs from trailing uncompressed bytes. Reduced-image primary IFDs are
+excluded from full-resolution stacks but are not currently exposed through the
+thumbnail API; the remaining TIFF codec and transform limitations are listed
+in the matrix above. The metadata surface is intentionally focused on pixels,
+dimensions, channels, physical sizes,
+acquisition timing, and selected annotations rather than Java Bio-Formats'
+full OME metadata graph and service/plugin APIs.
 
-The recommended next large milestone is generic TIFF stack and ImageJ
-hyperstack metadata parity. In particular, Java's minimal TIFF default maps
-same-layout pages along T and its ImageJ parser applies declared
-channels/slices/frames plus spatial and temporal calibration; the current Rust
-reader maps generic pages along Z and does not parse the ImageJ hyperstack
-fields.
+The recommended next large milestone is ND2 JPEG 2000 decoding plus a public
+compressed-fixture parity gate. It is the remaining explicit codec blocker in
+the ND2 reader and prevents otherwise recognized datasets from returning
+pixels.
 
 All six implemented reader families also run through an application-owned
 `RandomAccessSource`: TIFF/OME-TIFF, ND2, CZI, NRRD, MRC, and DCIMG. Integration

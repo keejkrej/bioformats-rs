@@ -32,6 +32,8 @@ pub mod tag {
     pub const JPEG_TABLES: u16 = 347;
     pub const SUB_IFD: u16 = 330;
     pub const YCBCR_SUBSAMPLING: u16 = 530;
+    /// ImageJ's private metadata tag, also parsed by Java Bio-Formats.
+    pub const IMAGEJ_METADATA: u16 = 50839;
 }
 
 /// TIFF compression scheme codes.

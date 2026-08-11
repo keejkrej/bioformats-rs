@@ -8,7 +8,9 @@ use crate::common::reader::FormatReader;
 use crate::registry::ImageReader;
 use crate::snapshot::{capture_fingerprint, fingerprint_matches, MemoFilePayload};
 
-const MEMO_VERSION: u32 = 2;
+// Version 3 invalidates TIFF snapshots created before generic stacks switched
+// from Z-major metadata to Java-compatible time/ImageJ axes.
+const MEMO_VERSION: u32 = 3;
 const DEFAULT_MINIMUM_ELAPSED_MS: u64 = 100;
 
 /// Caches initialized reader state to a `.bfmemo` file.

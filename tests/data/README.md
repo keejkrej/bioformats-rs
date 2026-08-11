@@ -77,3 +77,15 @@ cargo test --test fixture_gated -- --ignored
 
 Run a public gate by setting its listed environment variable and selecting its
 test name in `public_parity_gated`.
+
+The generated generic TIFF and ImageJ hyperstack oracle in
+`tests/tiff_imagej.rs` can also be compared directly with Java Bio-Formats.
+Point `BIOFORMATS_RS_BIOFORMATS_JAR` at a standalone
+`bioformats_package.jar`. Alternatively, point `BIOFORMATS_RS_BIOFORMATS_ROOT`
+at a Bio-Formats checkout whose `tools/showinf` script can find its built
+artifacts, then run:
+
+```bash
+cargo test --test tiff_imagej \
+  generated_generic_and_imagej_metadata_match_java_bioformats -- --ignored
+```
