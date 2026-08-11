@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use bioformats_rs::{
     open, open_source, BioFormatsError, CompanionReference, CompanionResolver, FormatReader,
-    PlaneCoordinates, RandomAccessSource, ReadRequest, Rect, Region, SourceId, SourceInfo,
-    SourceInput, SourceResult, TiffReader,
+    ImageReader, PlaneCoordinates, RandomAccessSource, ReadRequest, Rect, Region, SourceId,
+    SourceInfo, SourceInput, SourceResult, TiffReader,
 };
 
 struct MemorySource {
@@ -435,6 +435,29 @@ fn path_open_keeps_split_czi_discovery_backwards_compatible() {
         .read_plane(ReadRequest::new(0, PlaneCoordinates::new(1, 0, 0)))
         .expect("read path-backed CZI part");
     assert_eq!(second.bytes(), &[11, 12, 13, 14, 15, 16]);
+}
+
+#[test]
+fn split_czi_snapshot_retargets_from_the_part_that_was_opened() {
+    let mut fixture = SplitCziFixture::new();
+    let reader = ImageReader::open(&fixture.part).expect("open split CZI part");
+    let mut snapshot = reader.snapshot().expect("snapshot split CZI part");
+
+    fixture.relocate_and_rename("renamed");
+    snapshot.retarget_path(&fixture.part);
+    let mut restored = snapshot.into_reader().expect("restore split CZI snapshot");
+    assert_eq!(
+        restored.used_files(),
+        [fixture.master.clone(), fixture.part.clone()]
+    );
+    assert_eq!(
+        restored.open_bytes(0).expect("read restored master plane"),
+        [1, 2, 3, 4, 5, 6]
+    );
+    assert_eq!(
+        restored.open_bytes(1).expect("read restored part plane"),
+        [11, 12, 13, 14, 15, 16]
+    );
 }
 
 #[test]
@@ -893,6 +916,18 @@ impl SplitCziFixture {
             master,
             part,
         }
+    }
+
+    fn relocate_and_rename(&mut self, base: &str) {
+        let destination = self.directory.with_extension("moved");
+        std::fs::rename(&self.directory, &destination).expect("relocate split CZI directory");
+        self.directory = destination;
+        let old_master = self.directory.join("sample.czi");
+        let old_part = self.directory.join("sample (1).czi");
+        self.master = self.directory.join(format!("{base}.czi"));
+        self.part = self.directory.join(format!("{base} (1).czi"));
+        std::fs::rename(old_master, &self.master).expect("rename split CZI master");
+        std::fs::rename(old_part, &self.part).expect("rename split CZI part");
     }
 }
 
