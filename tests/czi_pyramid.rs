@@ -4,6 +4,7 @@ use bioformats_rs::{
     open, BioFormatsError, FormatId, FormatReader, ImageReader, PlaneCoordinates, ReadRequest,
     Rect, Region,
 };
+use sha2::{Digest, Sha256};
 
 const SEGMENT_HEADER: usize = 32;
 const FILE_HEADER_BODY: usize = 80;
@@ -26,6 +27,48 @@ const PADDED_JPEG_3X3_GRAY: &[u8] = &[
     243, 244, 245, 246, 247, 248, 249, 250, 255, 218, 0, 8, 1, 1, 0, 0, 63, 0, 248, 106, 191, 255,
     217,
 ];
+// JPEG-XR payload from bytes 67,438,689..=67,439,482 of the CC0 fixture
+// Zeiss-5-Cropped.czi, courtesy Venklab, Pathology, UTHSCSA:
+// https://openslide.cs.cmu.edu/download/openslide-testdata/Zeiss/Zeiss-5-Cropped.czi
+const JPEG_XR_291X201_BGR24_HEX: &str = concat!(
+    "4949bc0108000000090001bc0100100000007a00000002bc0400010000000000000004bc0400010000000000000080bc",
+    "0400010000002301000081bc040001000000c900000082bc0b00010000000000c04283bc0b00010000000000c042c0bc",
+    "0400010000008a000000c1bc040001000000900200000000000024c3dd6f034efe4bb1853d77768dc90c574d50484f54",
+    "4f0011c5c071012200c80010000a7000c304646c305c5cc446666000010000005400c2ff0119016701e0ff0004428000",
+    "01000001019740e034000008100041801000401c0a32aa4d956d2448b8a2a9254551cc795551a3555547355adcb46a02",
+    "80fbaa39bbebe4731a3efa8dc187e4bcdc7c3c6346aecb477d586ee81c1d826082cb15d5500000010200000000000000",
+    "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000001232ca3609d1b794011cc828000000000000000000004a934912a4d2c5c2088522553880c23380318c25226fb8",
+    "98d000000001034727ffecb41d375d16b5ff4489ffffffffffffffffffffec082456508ca10f054214a14ca04b2812ca",
+    "04b2812ca04b28128564428a92ca85215b2a144149259614449648549c8152720549c8152720549c8140000001099740",
+    "e0340000080000800040010020351843817b022555555555555555556b72aab745b496f4aa8a0245ed51654934d52dce",
+    "9d6b467579bbafcaf9b9e15e78e8b78c12021658255400060000010a0000000000000000000000000000000000000000",
+    "00000000000000000000000000000000000000000000000000000000000000000000000000102a9a4a06353108240000",
+    "0000000000040aa692008154d2400008154d2495271014a93880a549c406553880c233438a9b26938c621048022db6db",
+    "ec0000010b4727ea58245447205fea91111c817faa44447205feb4449c817fad1127205feb4449c817fad1127205feb4",
+    "449c817fad1127207fd68893903feb49239036c056c056c056c056c056c056c0501663ee8140ba056516672077892588",
+    "8692c443496221a4b121a4b121a4720691c81a4720691da34f60",
+);
+
+fn jpeg_xr_fixture() -> Vec<u8> {
+    assert_eq!(JPEG_XR_291X201_BGR24_HEX.len() % 2, 0);
+    JPEG_XR_291X201_BGR24_HEX
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).expect("ASCII JPEG-XR fixture hex");
+            u8::from_str_radix(pair, 16).expect("valid JPEG-XR fixture hex")
+        })
+        .collect()
+}
+
+fn assert_sha256(bytes: &[u8], expected: &str) {
+    let actual = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(actual, expected);
+}
 
 #[derive(Clone)]
 struct Tile {
@@ -290,7 +333,9 @@ fn czi_region_decodes_only_intersecting_mosaic_tiles() {
     let mut tiles = pyramid_tiles();
     for tile in &mut tiles {
         if tile.mosaic == 1 {
-            tile.compression = 4; // JPEG-XR remains unsupported.
+            // These raw bytes are intentionally malformed as JPEG-XR. A
+            // bounded read of the left tile must never attempt to decode them.
+            tile.compression = 4;
         }
     }
     let fixture = TemporaryCzi::new("lazy-mosaic-region", &tiles);
@@ -302,7 +347,7 @@ fn czi_region_decodes_only_intersecting_mosaic_tiles() {
                 Rect::new(0, 0, 4, 1).expect("valid left-tile region"),
             )),
         )
-        .expect("non-intersecting JPEG-XR tile must not be decoded");
+        .expect("non-intersecting malformed JPEG-XR tile must not be decoded");
     assert_eq!(left.bytes(), [1, 2, 3, 4]);
 
     let gap = dataset
@@ -319,24 +364,31 @@ fn czi_region_decodes_only_intersecting_mosaic_tiles() {
             0,
             PlaneCoordinates::new(0, 0, 0)
         )),
-        Err(BioFormatsError::UnsupportedFormat(message))
+        Err(BioFormatsError::Codec(message))
             if message.contains("JPEG-XR")
     ));
 }
 
 #[test]
-fn czi_thumbnail_falls_back_to_the_readable_active_resolution() {
-    let mut reduced = Tile::raw(0, 0, 2, 2, 1, 1, 0, 0, &[0]);
-    reduced.compression = 4; // The available pyramid level uses JPEG-XR.
-    let tiles = vec![Tile::raw(0, 0, 2, 2, 2, 2, 0, 0, &[1, 2, 3, 4]), reduced];
-    let fixture = TemporaryCzi::new("thumbnail-codec-fallback", &tiles);
+fn czi_thumbnail_reads_the_supported_smallest_jpegxr_level() {
+    let native = vec![1; 582 * 402 * 3];
+    let mut reduced =
+        Tile::raw(0, 0, 582, 402, 291, 201, 0, 0, &jpeg_xr_fixture()).with_pixel_type(3);
+    reduced.compression = 4;
+    let tiles = vec![
+        Tile::raw(0, 0, 582, 402, 582, 402, 0, 0, &native).with_pixel_type(3),
+        reduced,
+    ];
+    let fixture = TemporaryCzi::new("thumbnail-jpegxr", &tiles);
     let mut reader = ImageReader::open(fixture.path()).expect("open mixed-codec CZI pyramid");
 
-    assert_eq!(
-        reader
-            .open_thumb_bytes(0)
-            .expect("fall back from JPEG-XR pyramid to the raw active level"),
-        [1, 2, 3, 4]
+    let thumbnail = reader
+        .open_thumb_bytes(0)
+        .expect("decode the supported JPEG-XR pyramid level");
+    assert_eq!(thumbnail.len(), 291 * 201 * 3);
+    assert_sha256(
+        &thumbnail,
+        "8083bc4b6c71d92bbe956a942087002225b41bedfef824254ea450f7300b36b9",
     );
 }
 
@@ -472,6 +524,108 @@ fn czi_jpeg_vendor_padding_is_cropped_to_the_stored_tile() {
         .read_plane(ReadRequest::new(0, PlaneCoordinates::default()))
         .expect("crop vendor-padded JPEG tile");
     assert_eq!(plane.bytes(), [42, 42, 42, 42]);
+}
+
+#[test]
+fn czi_jpegxr_decodes_full_rgb_plane_and_bounded_region() {
+    let payload = jpeg_xr_fixture();
+    assert_eq!(payload.len(), 794);
+    assert_sha256(
+        &payload,
+        "d596b5d3046179a55967906c9f115b39679c629fd930ced60360040a4f0729d6",
+    );
+
+    let mut tile = Tile::raw(0, 0, 291, 201, 291, 201, 0, 0, &payload).with_pixel_type(3);
+    tile.compression = 4;
+    let fixture = TemporaryCzi::new("jpegxr-rgb", &[tile]);
+    let dataset = open(fixture.path()).expect("open JPEG-XR CZI");
+
+    let plane = dataset
+        .read_plane(ReadRequest::new(0, PlaneCoordinates::default()))
+        .expect("decode complete JPEG-XR CZI tile");
+    assert_eq!(plane.bytes().len(), 291 * 201 * 3);
+    assert_sha256(
+        plane.bytes(),
+        "8083bc4b6c71d92bbe956a942087002225b41bedfef824254ea450f7300b36b9",
+    );
+
+    let region = dataset
+        .read_plane(
+            ReadRequest::new(0, PlaneCoordinates::default()).with_region(Region::Rect(
+                Rect::new(285, 190, 5, 3).expect("valid JPEG-XR region"),
+            )),
+        )
+        .expect("decode bounded JPEG-XR CZI region");
+    assert_eq!(
+        region.bytes(),
+        [
+            171, 178, 173, 174, 181, 176, 178, 183, 179, 180, 182, 180, 215, 216, 215, 175, 180,
+            177, 179, 184, 181, 182, 186, 183, 183, 184, 183, 213, 214, 213, 182, 185, 182, 187,
+            190, 188, 189, 191, 190, 188, 189, 188, 213, 213, 213,
+        ]
+    );
+}
+
+#[test]
+fn czi_jpegxr_reports_codec_errors_for_malformed_and_truncated_payloads() {
+    let mut malformed =
+        Tile::raw(0, 0, 1, 1, 1, 1, 0, 0, &[0xde, 0xad, 0xbe, 0xef]).with_pixel_type(3);
+    malformed.compression = 4;
+    let malformed_fixture = TemporaryCzi::new("jpegxr-malformed", &[malformed]);
+    let malformed_dataset = open(malformed_fixture.path()).expect("open malformed JPEG-XR CZI");
+    let error = malformed_dataset
+        .read_plane(ReadRequest::new(0, PlaneCoordinates::default()))
+        .expect_err("malformed JPEG-XR payload must fail");
+    assert!(
+        matches!(&error, BioFormatsError::Codec(message) if message.contains("JPEG-XR")),
+        "unexpected malformed-payload error: {error:?}"
+    );
+
+    let payload = jpeg_xr_fixture();
+    let mut truncated =
+        Tile::raw(0, 0, 291, 201, 291, 201, 0, 0, &payload[..397]).with_pixel_type(3);
+    truncated.compression = 4;
+    let truncated_fixture = TemporaryCzi::new("jpegxr-truncated", &[truncated]);
+    let truncated_dataset = open(truncated_fixture.path()).expect("open truncated JPEG-XR CZI");
+    let error = truncated_dataset
+        .read_plane(ReadRequest::new(0, PlaneCoordinates::default()))
+        .expect_err("truncated JPEG-XR payload must fail");
+    assert!(
+        matches!(&error, BioFormatsError::Codec(message) if message.contains("JPEG-XR")),
+        "unexpected truncated-payload error: {error:?}"
+    );
+}
+
+#[test]
+fn czi_jpegxr_reports_invalid_data_for_dimension_and_pixel_layout_mismatches() {
+    let payload = jpeg_xr_fixture();
+    let mut wrong_dimensions =
+        Tile::raw(0, 0, 290, 201, 290, 201, 0, 0, &payload).with_pixel_type(3);
+    wrong_dimensions.compression = 4;
+    let dimensions_fixture = TemporaryCzi::new("jpegxr-dimensions", &[wrong_dimensions]);
+    let dimensions_dataset =
+        open(dimensions_fixture.path()).expect("open dimension-mismatched JPEG-XR CZI");
+    let error = dimensions_dataset
+        .read_plane(ReadRequest::new(0, PlaneCoordinates::default()))
+        .expect_err("JPEG-XR dimensions must match the CZI directory entry");
+    assert!(
+        matches!(&error, BioFormatsError::InvalidData(message)
+            if message.contains("291x201") && message.contains("290x201")),
+        "unexpected dimension-mismatch error: {error:?}"
+    );
+
+    let mut wrong_layout = Tile::raw(0, 0, 291, 201, 291, 201, 0, 0, &payload);
+    wrong_layout.compression = 4;
+    let layout_fixture = TemporaryCzi::new("jpegxr-layout", &[wrong_layout]);
+    let layout_dataset = open(layout_fixture.path()).expect("open layout-mismatched JPEG-XR CZI");
+    let error = layout_dataset
+        .read_plane(ReadRequest::new(0, PlaneCoordinates::default()))
+        .expect_err("JPEG-XR pixel layout must match the CZI pixel type");
+    assert!(
+        matches!(&error, BioFormatsError::InvalidData(message)
+            if message.contains("pixel layout") && message.contains("Uint8")),
+        "unexpected pixel-layout error: {error:?}"
+    );
 }
 
 #[test]

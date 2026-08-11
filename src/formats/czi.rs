@@ -7,8 +7,7 @@
 //! - multi-file dataset discovery
 //! - typed metadata extraction from the CZI metadata XML
 //!
-//! Supported compressions: Uncompressed, JPEG (new-style), LZW, Zstd.
-//! JPEG-XR is detected but not decoded.
+//! Supported compressions: Uncompressed, JPEG (new-style), JPEG-XR, LZW, Zstd.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
@@ -26,6 +25,7 @@ use crate::common::metadata::{
 };
 use crate::common::pixel_type::PixelType;
 use crate::common::reader::{validate_region, FormatReader};
+use crate::jpegxr::{BitDepthBits, ColorFormat, ImageDecode, PixelInfo};
 use crate::snapshot::ReaderSnapshot;
 use crate::source::{SourceHandle, SourceInfo, SourceInput};
 use roxmltree::{Document, Node};
@@ -276,9 +276,92 @@ fn parse_dir_entry(data: &[u8]) -> std::io::Result<DirEntry> {
 struct CziParsedFile {
     meta_xml: String,
     entries: Vec<DirEntry>,
+    attachments: Vec<CziParsedAttachment>,
 }
 
 fn parse_czi_file<R: Read + Seek>(f: &mut R, file_len: u64) -> std::io::Result<CziParsedFile> {
+    parse_czi_file_inner(f, file_len, true)
+}
+
+trait CziReadSeek: Read + Seek {}
+
+impl<T: Read + Seek + ?Sized> CziReadSeek for T {}
+
+struct CziParsedAttachment {
+    name: String,
+    meta_xml: String,
+    entries: Vec<DirEntry>,
+    container_start: u64,
+    container_end: u64,
+}
+
+struct CziBoundedReader<'a> {
+    inner: &'a mut dyn CziReadSeek,
+    start: u64,
+    length: u64,
+    position: u64,
+}
+
+impl<'a> CziBoundedReader<'a> {
+    fn new(inner: &'a mut dyn CziReadSeek, start: u64, length: u64) -> std::io::Result<Self> {
+        start
+            .checked_add(length)
+            .ok_or_else(|| invalid_czi("CZI embedded attachment range overflows"))?;
+        Ok(Self {
+            inner,
+            start,
+            length,
+            position: 0,
+        })
+    }
+}
+
+impl Read for CziBoundedReader<'_> {
+    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.length.saturating_sub(self.position);
+        let maximum = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(destination.len());
+        if maximum == 0 {
+            return Ok(0);
+        }
+        let absolute = self
+            .start
+            .checked_add(self.position)
+            .ok_or_else(|| invalid_czi("CZI embedded attachment read offset overflows"))?;
+        self.inner.seek(SeekFrom::Start(absolute))?;
+        let read = self.inner.read(&mut destination[..maximum])?;
+        self.position = self
+            .position
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| invalid_czi("CZI embedded attachment position overflows"))?;
+        Ok(read)
+    }
+}
+
+impl Seek for CziBoundedReader<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let requested = match position {
+            SeekFrom::Start(position) => i128::from(position),
+            SeekFrom::Current(offset) => i128::from(self.position) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.length) + i128::from(offset),
+        };
+        if requested < 0 || requested > i128::from(self.length) {
+            return Err(invalid_czi(
+                "CZI embedded attachment seek exceeds its container",
+            ));
+        }
+        self.position = u64::try_from(requested)
+            .map_err(|_| invalid_czi("CZI embedded attachment seek is invalid"))?;
+        Ok(self.position)
+    }
+}
+
+fn parse_czi_file_inner(
+    f: &mut dyn CziReadSeek,
+    file_len: u64,
+    include_attachments: bool,
+) -> std::io::Result<CziParsedFile> {
     let mut hdr = vec![0u8; SEG_HEADER];
     f.read_exact(&mut hdr)?;
     let seg_type = read_seg_type(&hdr);
@@ -293,8 +376,10 @@ fn parse_czi_file<R: Read + Seek>(f: &mut R, file_len: u64) -> std::io::Result<C
     f.read_exact(&mut fh)?;
     // FileHeader payload: versions/reserved (16), two 16-byte GUIDs (32),
     // file part (4), then the directory and metadata positions.
+    let file_part = read_i32(&fh, 48);
     let dir_position = read_u64(&fh, 52);
     let meta_position = read_u64(&fh, 60);
+    let attachment_directory_position = read_u64(&fh, 72);
 
     let mut meta_xml = String::new();
     if meta_position > 0 {
@@ -387,7 +472,270 @@ fn parse_czi_file<R: Read + Seek>(f: &mut R, file_len: u64) -> std::io::Result<C
         }
     }
 
-    Ok(CziParsedFile { meta_xml, entries })
+    let attachments = if include_attachments && attachment_directory_position > 0 {
+        parse_czi_attachments(f, file_len, file_part, attachment_directory_position)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(CziParsedFile {
+        meta_xml,
+        entries,
+        attachments,
+    })
+}
+
+#[derive(Debug)]
+struct CziAttachmentDirectoryEntry {
+    file_position: u64,
+    file_part: i32,
+    content_file_type: String,
+    name: String,
+}
+
+fn czi_fixed_string(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).trim().to_owned()
+}
+
+fn validate_czi_subblock_segments(
+    reader: &mut dyn CziReadSeek,
+    file_len: u64,
+    entries: &[DirEntry],
+) -> std::io::Result<()> {
+    for entry in entries {
+        let position = u64::try_from(entry.file_position)
+            .map_err(|_| invalid_czi("negative embedded CZI subblock position"))?;
+        let header_end = position
+            .checked_add(SEG_HEADER as u64)
+            .ok_or_else(|| invalid_czi("embedded CZI subblock header range overflows"))?;
+        if header_end > file_len {
+            return Err(invalid_czi(format!(
+                "embedded CZI subblock header ends at {header_end}, beyond its {file_len}-byte container"
+            )));
+        }
+        reader.seek(SeekFrom::Start(position))?;
+        let mut header = [0_u8; SEG_HEADER];
+        reader.read_exact(&mut header)?;
+        if !read_seg_type(&header).starts_with("ZISRAWSUBBLOCK") {
+            return Err(invalid_czi(
+                "embedded CZI directory entry does not reference a subblock",
+            ));
+        }
+        validate_segment_range(
+            position,
+            segment_used_size(&header)?,
+            file_len,
+            "embedded attachment subblock",
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_czi_attachments(
+    reader: &mut dyn CziReadSeek,
+    file_len: u64,
+    file_part: i32,
+    directory_position: u64,
+) -> std::io::Result<Vec<CziParsedAttachment>> {
+    let header_end = directory_position
+        .checked_add(SEG_HEADER as u64)
+        .ok_or_else(|| invalid_czi("CZI attachment directory header range overflows"))?;
+    if header_end > file_len {
+        return Err(invalid_czi(
+            "CZI attachment directory header exceeds the source",
+        ));
+    }
+    reader.seek(SeekFrom::Start(directory_position))?;
+    let mut segment_header = [0_u8; SEG_HEADER];
+    reader.read_exact(&mut segment_header)?;
+    if !read_seg_type(&segment_header).starts_with("ZISRAWATTDIR") {
+        return Err(invalid_czi(
+            "CZI attachment-directory pointer does not reference an attachment directory",
+        ));
+    }
+    let used_size = segment_used_size(&segment_header)?;
+    validate_segment_range(
+        directory_position,
+        used_size,
+        file_len,
+        "attachment directory",
+    )?;
+    if used_size < 256 {
+        return Err(invalid_czi(
+            "CZI attachment directory is shorter than its header",
+        ));
+    }
+
+    let mut directory_header = [0_u8; 256];
+    reader.read_exact(&mut directory_header)?;
+    let entry_count = usize::try_from(read_i32(&directory_header, 0))
+        .map_err(|_| invalid_czi("negative CZI attachment directory entry count"))?;
+    let entry_bytes = entry_count
+        .checked_mul(128)
+        .ok_or_else(|| invalid_czi("CZI attachment directory size overflows"))?;
+    let payload_size = u64::try_from(entry_bytes)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| invalid_czi("CZI attachment directory payload size overflows"))?;
+    if payload_size > used_size {
+        return Err(invalid_czi(
+            "CZI attachment entries exceed their directory segment",
+        ));
+    }
+
+    let mut candidates = Vec::new();
+    candidates.try_reserve_exact(entry_count).map_err(|error| {
+        invalid_czi(format!(
+            "cannot allocate CZI attachment directory entries: {error}"
+        ))
+    })?;
+    for _ in 0..entry_count {
+        let mut entry = [0_u8; 128];
+        reader.read_exact(&mut entry)?;
+        let name = czi_fixed_string(&entry[48..128]);
+        if name != "Label" && name != "SlidePreview" {
+            continue;
+        }
+        let file_position = u64::try_from(read_i64(&entry, 12))
+            .map_err(|_| invalid_czi(format!("negative CZI {name} attachment position")))?;
+        candidates.push(CziAttachmentDirectoryEntry {
+            file_position,
+            file_part: read_i32(&entry, 20),
+            content_file_type: czi_fixed_string(&entry[40..48]),
+            name,
+        });
+    }
+    candidates.sort_by_key(|entry| entry.file_position);
+
+    let mut attachments = Vec::new();
+    attachments.try_reserve_exact(2).map_err(|error| {
+        invalid_czi(format!("cannot allocate selected CZI attachments: {error}"))
+    })?;
+    let mut found_label = false;
+    let mut found_preview = false;
+    for candidate in candidates {
+        let already_found = match candidate.name.as_str() {
+            "Label" => found_label,
+            "SlidePreview" => found_preview,
+            _ => true,
+        };
+        if already_found || candidate.file_part != file_part {
+            continue;
+        }
+        if candidate.content_file_type != "CZI" {
+            return Err(invalid_czi(format!(
+                "CZI {} attachment has content type {:?}, not CZI",
+                candidate.name, candidate.content_file_type
+            )));
+        }
+
+        let attachment_header_end = candidate
+            .file_position
+            .checked_add(SEG_HEADER as u64)
+            .ok_or_else(|| invalid_czi("CZI attachment segment header range overflows"))?;
+        if attachment_header_end > file_len {
+            return Err(invalid_czi(format!(
+                "CZI {} attachment header exceeds the source",
+                candidate.name
+            )));
+        }
+        reader.seek(SeekFrom::Start(candidate.file_position))?;
+        let mut attachment_segment_header = [0_u8; SEG_HEADER];
+        reader.read_exact(&mut attachment_segment_header)?;
+        if !read_seg_type(&attachment_segment_header).starts_with("ZISRAWATTACH") {
+            return Err(invalid_czi(format!(
+                "CZI {} attachment entry does not reference an attachment segment",
+                candidate.name
+            )));
+        }
+        let attachment_used_size = segment_used_size(&attachment_segment_header)?;
+        validate_segment_range(
+            candidate.file_position,
+            attachment_used_size,
+            file_len,
+            &format!("{} attachment", candidate.name),
+        )?;
+        if attachment_used_size < 256 {
+            return Err(invalid_czi(format!(
+                "CZI {} attachment is shorter than its header",
+                candidate.name
+            )));
+        }
+
+        let mut attachment_header = [0_u8; 256];
+        reader.read_exact(&mut attachment_header)?;
+        let data_size = u64::try_from(read_i32(&attachment_header, 0)).map_err(|_| {
+            invalid_czi(format!(
+                "negative CZI {} attachment data size",
+                candidate.name
+            ))
+        })?;
+        let repeated_entry = &attachment_header[16..144];
+        let repeated_name = czi_fixed_string(&repeated_entry[48..128]);
+        let repeated_type = czi_fixed_string(&repeated_entry[40..48]);
+        let repeated_position = u64::try_from(read_i64(repeated_entry, 12))
+            .map_err(|_| invalid_czi("negative repeated CZI attachment position"))?;
+        if repeated_name != candidate.name
+            || repeated_type != candidate.content_file_type
+            || read_i32(repeated_entry, 20) != candidate.file_part
+            || repeated_position != candidate.file_position
+        {
+            return Err(invalid_czi(format!(
+                "CZI {} attachment header does not match its directory entry",
+                candidate.name
+            )));
+        }
+        let attachment_payload_size = data_size
+            .checked_add(256)
+            .ok_or_else(|| invalid_czi("CZI attachment payload size overflows"))?;
+        if attachment_payload_size > attachment_used_size {
+            return Err(invalid_czi(format!(
+                "CZI {} attachment data exceeds its segment",
+                candidate.name
+            )));
+        }
+        let container_start = candidate
+            .file_position
+            .checked_add(SEG_HEADER as u64)
+            .and_then(|position| position.checked_add(256))
+            .ok_or_else(|| invalid_czi("CZI attachment data position overflows"))?;
+        let container_end = container_start
+            .checked_add(data_size)
+            .ok_or_else(|| invalid_czi("CZI attachment data range overflows"))?;
+
+        let mut bounded = CziBoundedReader::new(reader, container_start, data_size)?;
+        let mut parsed = parse_czi_file_inner(&mut bounded, data_size, false)?;
+        validate_czi_subblock_segments(&mut bounded, data_size, &parsed.entries)?;
+        for entry in &mut parsed.entries {
+            let relative = u64::try_from(entry.file_position)
+                .map_err(|_| invalid_czi("negative embedded CZI subblock position"))?;
+            let absolute = container_start
+                .checked_add(relative)
+                .ok_or_else(|| invalid_czi("embedded CZI subblock position overflows"))?;
+            entry.file_position = i64::try_from(absolute)
+                .map_err(|_| invalid_czi("embedded CZI subblock position exceeds i64"))?;
+        }
+        attachments.push(CziParsedAttachment {
+            name: candidate.name.clone(),
+            meta_xml: parsed.meta_xml,
+            entries: parsed.entries,
+            container_start,
+            container_end,
+        });
+        if candidate.name == "Label" {
+            found_label = true;
+        } else {
+            found_preview = true;
+        }
+        if found_label && found_preview {
+            break;
+        }
+    }
+    Ok(attachments)
 }
 
 fn decompress_subblock(data: &[u8], compression: i32, expected_len: usize) -> Result<Vec<u8>> {
@@ -415,8 +763,8 @@ fn decompress_subblock(data: &[u8], compression: i32, expected_len: usize) -> Re
                 .map_err(|e| BioFormatsError::Codec(e.to_string()))
         }
         2 => decompress_lzw_limited(data, expected_len),
-        4 => Err(BioFormatsError::UnsupportedFormat(
-            "CZI: JPEG-XR compression not yet supported".into(),
+        4 => Err(BioFormatsError::InvalidData(
+            "CZI JPEG-XR decoding requires the stored tile dimensions".into(),
         )),
         5 => decompress_zstd_limited(data, expected_len),
         6 => {
@@ -536,6 +884,111 @@ fn decompress_czi_jpeg(
     Ok(cropped)
 }
 
+fn decompress_czi_jpegxr(
+    data: &[u8],
+    stored_width: u32,
+    stored_height: u32,
+    samples_per_pixel: u32,
+    pixel_type: PixelType,
+    rgb: bool,
+) -> Result<Vec<u8>> {
+    let mut decoder = ImageDecode::with_reader(std::io::Cursor::new(data)).map_err(|error| {
+        BioFormatsError::Codec(format!(
+            "CZI JPEG-XR decoder initialization failed: {error}"
+        ))
+    })?;
+    let (decoded_width, decoded_height) = decoder.get_size().map_err(|error| {
+        BioFormatsError::Codec(format!("CZI JPEG-XR dimensions could not be read: {error}"))
+    })?;
+    let decoded_width = u32::try_from(decoded_width).map_err(|_| {
+        BioFormatsError::InvalidData(format!(
+            "CZI JPEG-XR decoded with invalid width {decoded_width}"
+        ))
+    })?;
+    let decoded_height = u32::try_from(decoded_height).map_err(|_| {
+        BioFormatsError::InvalidData(format!(
+            "CZI JPEG-XR decoded with invalid height {decoded_height}"
+        ))
+    })?;
+    if decoded_width != stored_width || decoded_height != stored_height {
+        return Err(BioFormatsError::InvalidData(format!(
+            "CZI JPEG-XR decoded to {decoded_width}x{decoded_height}; expected stored dimensions {stored_width}x{stored_height}"
+        )));
+    }
+
+    let format = decoder.get_pixel_format().map_err(|error| {
+        BioFormatsError::Codec(format!(
+            "CZI JPEG-XR pixel format could not be read: {error}"
+        ))
+    })?;
+    let info = PixelInfo::from_format(format);
+    let expected_samples =
+        usize::try_from(samples_per_pixel).map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+    let expected_bits_per_sample = pixel_type
+        .bytes_per_sample()
+        .checked_mul(8)
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    let depth_matches = matches!(
+        (pixel_type, info.bit_depth()),
+        (PixelType::Uint8, BitDepthBits::Eight)
+            | (PixelType::Uint16, BitDepthBits::Sixteen)
+            | (PixelType::Uint32, BitDepthBits::ThirtyTwo)
+            | (PixelType::Float32, BitDepthBits::ThirtyTwoF)
+    );
+    let color_matches = if rgb {
+        info.color_format() == ColorFormat::RGB
+    } else {
+        info.color_format() == ColorFormat::YOnly
+    };
+    let expected_bits_per_pixel = expected_samples
+        .checked_mul(expected_bits_per_sample)
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    if info.samples_per_pixel() != expected_samples
+        || info.channels() != expected_samples
+        || info.bits_per_pixel() != expected_bits_per_pixel
+        || !depth_matches
+        || !color_matches
+    {
+        return Err(BioFormatsError::InvalidData(format!(
+            "CZI JPEG-XR pixel layout {:?}/{:?}, {} samples, {} channels, {} bits per pixel does not match the CZI {:?} layout with {samples_per_pixel} samples",
+            info.color_format(),
+            info.bit_depth(),
+            info.samples_per_pixel(),
+            info.channels(),
+            info.bits_per_pixel(),
+            pixel_type,
+        )));
+    }
+
+    let expected_len = czi_byte_len(stored_width, stored_height, samples_per_pixel, pixel_type)?;
+    let stride = usize::try_from(stored_width)
+        .ok()
+        .and_then(|width| width.checked_mul(expected_bits_per_pixel / 8))
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(expected_len).map_err(|error| {
+        BioFormatsError::InvalidData(format!(
+            "cannot allocate {expected_len}-byte CZI JPEG-XR tile: {error}"
+        ))
+    })?;
+    output.resize(expected_len, 0);
+    decoder
+        .copy_all(&mut output, stride)
+        .map_err(|error| BioFormatsError::Codec(format!("CZI JPEG-XR decoding failed: {error}")))?;
+
+    // JXRLib exposes the stored channel order through its pixel-format GUID.
+    // Normalize here, as Java's JPEGXRService does, so the generic CZI BGR
+    // transform below is not applied a second time.
+    if info.bgr() {
+        bgr_to_rgb_in_place(
+            &mut output,
+            samples_per_pixel,
+            pixel_type.bytes_per_sample(),
+        );
+    }
+    Ok(output)
+}
+
 fn parse_zstd1_header(data: &[u8]) -> Result<(usize, bool)> {
     let mut position = 0_usize;
     let header_size = read_zstd1_varint(data, &mut position)?;
@@ -596,6 +1049,10 @@ fn read_zstd1_varint(data: &[u8], position: &mut usize) -> Result<usize> {
 pub struct CziLocatedEntry {
     file_index: usize,
     entry: DirEntry,
+    #[serde(default)]
+    container_start: u64,
+    #[serde(default)]
+    container_end: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1871,10 +2328,26 @@ impl CziReader {
             .get(located.file_index)
             .ok_or(BioFormatsError::NotInitialized)?;
         let file_len = source.info().len();
+        let container_end = located.container_end.unwrap_or(file_len);
+        if located.container_start > container_end || container_end > file_len {
+            return Err(BioFormatsError::InvalidData(format!(
+                "CZI subblock container {}..{container_end} is outside the {file_len}-byte source",
+                located.container_start
+            )));
+        }
         let mut reader = source.cursor();
 
         let segment_position = u64::try_from(located.entry.file_position)
             .map_err(|_| BioFormatsError::InvalidData("negative CZI subblock position".into()))?;
+        let segment_header_end = segment_position
+            .checked_add(SEG_HEADER as u64)
+            .ok_or_else(|| BioFormatsError::InvalidData("CZI subblock header overflows".into()))?;
+        if segment_position < located.container_start || segment_header_end > container_end {
+            return Err(BioFormatsError::InvalidData(format!(
+                "CZI subblock header {segment_position}..{segment_header_end} escapes its container {}..{container_end}",
+                located.container_start
+            )));
+        }
         reader
             .seek(SeekFrom::Start(segment_position))
             .map_err(BioFormatsError::from)?;
@@ -1888,8 +2361,13 @@ impl CziReader {
             ));
         }
         let used_size = segment_used_size(&seg_hdr).map_err(BioFormatsError::from)?;
-        validate_segment_range(segment_position, used_size, file_len, "subblock")
-            .map_err(BioFormatsError::from)?;
+        validate_segment_range(
+            segment_position,
+            used_size,
+            container_end,
+            "subblock container",
+        )
+        .map_err(BioFormatsError::from)?;
         let mut subblock_hdr = vec![0u8; 16];
         reader
             .read_exact(&mut subblock_hdr)
@@ -1922,9 +2400,9 @@ impl CziReader {
         let data_end = data_position
             .checked_add(data_size_u64)
             .ok_or_else(|| BioFormatsError::InvalidData("CZI data range overflow".into()))?;
-        if data_end > file_len {
+        if data_end > container_end {
             return Err(BioFormatsError::InvalidData(format!(
-                "CZI pixel block ends at {data_end}, beyond file length {file_len}"
+                "CZI pixel block ends at {data_end}, beyond its container end {container_end}"
             )));
         }
         let expected = czi_byte_len(
@@ -1953,16 +2431,23 @@ impl CziReader {
         reader
             .read_exact(&mut compressed)
             .map_err(BioFormatsError::from)?;
-        let mut raw = if located.entry.compression == 1 {
-            decompress_czi_jpeg(
+        let mut raw = match located.entry.compression {
+            1 => decompress_czi_jpeg(
                 &compressed,
                 tile.width,
                 tile.height,
                 series.samples_per_pixel,
                 series.metadata.pixel_type,
-            )?
-        } else {
-            decompress_subblock(&compressed, located.entry.compression, expected)?
+            )?,
+            4 => decompress_czi_jpegxr(
+                &compressed,
+                tile.width,
+                tile.height,
+                series.samples_per_pixel,
+                series.metadata.pixel_type,
+                series.samples_per_pixel > 1,
+            )?,
+            compression => decompress_subblock(&compressed, compression, expected)?,
         };
         if raw.len() != expected {
             return Err(BioFormatsError::InvalidData(format!(
@@ -1970,7 +2455,7 @@ impl CziReader {
                 raw.len()
             )));
         }
-        if series.bgr_order {
+        if series.bgr_order && located.entry.compression != 4 {
             bgr_to_rgb_in_place(
                 &mut raw,
                 series.samples_per_pixel,
@@ -2196,6 +2681,8 @@ impl FormatReader for CziReader {
             .filter_map(|source| source.path().map(Path::to_path_buf))
             .collect::<Vec<_>>();
         let mut entries = Vec::new();
+        let mut attachments = Vec::<(usize, CziParsedAttachment)>::new();
+        let mut selected_attachment_names = HashSet::new();
         let mut meta_xml = String::new();
 
         for (file_index, source) in sources.iter().enumerate() {
@@ -2205,15 +2692,74 @@ impl FormatReader for CziReader {
             if meta_xml.is_empty() && !parsed.meta_xml.trim().is_empty() {
                 meta_xml = parsed.meta_xml.clone();
             }
-            entries.extend(
-                parsed
-                    .entries
-                    .into_iter()
-                    .map(|entry| CziLocatedEntry { file_index, entry }),
-            );
+            entries.extend(parsed.entries.into_iter().map(|entry| CziLocatedEntry {
+                file_index,
+                entry,
+                container_start: 0,
+                container_end: Some(source.info().len()),
+            }));
+            for attachment in parsed.attachments {
+                if selected_attachment_names.insert(attachment.name.clone()) {
+                    attachments.push((file_index, attachment));
+                }
+            }
         }
 
-        let series = build_czi_series(&entries, &meta_xml, &used_files)?;
+        let mut series = build_czi_series(&entries, &meta_xml, &used_files)?;
+        for (file_index, attachment) in attachments {
+            let entry_offset = entries.len();
+            let attachment_entries = attachment
+                .entries
+                .into_iter()
+                .map(|entry| CziLocatedEntry {
+                    file_index,
+                    entry,
+                    container_start: attachment.container_start,
+                    container_end: Some(attachment.container_end),
+                })
+                .collect::<Vec<_>>();
+            let mut attachment_series =
+                build_czi_series(&attachment_entries, &attachment.meta_xml, &used_files)?;
+            if attachment_series.len() != 1
+                || attachment_series[0].resolutions.len() != 1
+                || attachment_series[0].metadata.image_count != 1
+            {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "CZI {} attachment is not a one-series, one-resolution, one-plane image",
+                    attachment.name
+                )));
+            }
+            for attached in &mut attachment_series {
+                attached.metadata.series_metadata.insert(
+                    "czi_attachment_name".into(),
+                    MetadataValue::String(attachment.name.clone()),
+                );
+                attached
+                    .metadata
+                    .series_metadata
+                    .insert("czi_attachment_thumbnail".into(), MetadataValue::Bool(true));
+                for resolution in &mut attached.resolutions {
+                    resolution.metadata.series_metadata.insert(
+                        "czi_attachment_name".into(),
+                        MetadataValue::String(attachment.name.clone()),
+                    );
+                    resolution
+                        .metadata
+                        .series_metadata
+                        .insert("czi_attachment_thumbnail".into(), MetadataValue::Bool(true));
+                    for plane in &mut resolution.planes {
+                        for tile in &mut plane.tiles {
+                            tile.entry_index = tile
+                                .entry_index
+                                .checked_add(entry_offset)
+                                .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+                        }
+                    }
+                }
+            }
+            entries.extend(attachment_entries);
+            series.append(&mut attachment_series);
+        }
         self.path = primary_path;
         self.used_files = used_files;
         self.sources = sources;
@@ -2540,6 +3086,8 @@ mod tests {
     fn entry(pixel_type: i32, dims: &[(&str, (i32, i32))]) -> CziLocatedEntry {
         CziLocatedEntry {
             file_index: 0,
+            container_start: 0,
+            container_end: None,
             entry: DirEntry {
                 pixel_type,
                 file_position: 0,

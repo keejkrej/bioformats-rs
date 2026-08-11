@@ -539,6 +539,142 @@ fn czi_pixels_match_java_bioformats() {
 }
 
 #[test]
+#[ignore = "requires the public Zeiss-5-Cropped JPEG-XR CZI fixture; see tests/data/README.md"]
+fn czi_jpegxr_pyramids_and_attachments_match_java_bioformats_8_5() {
+    let path = fixture("BIOFORMATS_RS_CZI_JPEGXR_PYRAMID_FIXTURE");
+
+    let expected_dimensions: &[&[(u32, u32)]] = &[
+        &[
+            (20_563, 20_164),
+            (10_281, 10_082),
+            (5_140, 5_041),
+            (2_570, 2_520),
+            (1_285, 1_260),
+            (642, 630),
+        ],
+        &[(3_899, 4_676), (1_949, 2_338), (974, 1_169), (487, 584)],
+        &[(640, 515)],
+        &[(1_260, 615)],
+    ];
+
+    let mut reader = ImageReader::open(&path).expect("open public JPEG-XR CZI");
+    assert_eq!(reader.format(), Some(FormatId::Czi));
+    assert_eq!(reader.series_count(), 12, "flattened resolution view");
+    reader
+        .set_flattened_resolutions(false)
+        .expect("select hierarchical resolution view");
+    assert_eq!(reader.series_count(), expected_dimensions.len());
+    for (series, resolutions) in expected_dimensions.iter().enumerate() {
+        reader.set_series(series).expect("select CZI root series");
+        assert_eq!(reader.resolution_count(), resolutions.len());
+        for (resolution, &(size_x, size_y)) in resolutions.iter().enumerate() {
+            reader
+                .set_resolution(resolution)
+                .expect("select CZI pyramid resolution");
+            assert_eq!(
+                (reader.metadata().size_x, reader.metadata().size_y),
+                (size_x, size_y)
+            );
+        }
+    }
+
+    let dataset = open(&path).expect("open public JPEG-XR CZI dataset");
+    assert_eq!(dataset.format(), FormatId::Czi);
+    assert_eq!(dataset.series().len(), expected_dimensions.len());
+    for (series, resolutions) in expected_dimensions.iter().enumerate() {
+        assert_eq!(
+            dataset.series()[series].resolutions().len(),
+            resolutions.len()
+        );
+        for (resolution, &(size_x, size_y)) in resolutions.iter().enumerate() {
+            let metadata = dataset.series()[series].resolutions()[resolution].metadata();
+            assert_eq!((metadata.size_x, metadata.size_y), (size_x, size_y));
+            assert_eq!(
+                (metadata.size_z, metadata.size_c, metadata.size_t),
+                (1, 3, 1)
+            );
+            assert_eq!(metadata.image_count, 1);
+            assert_eq!(metadata.samples_per_pixel, 3);
+            assert_eq!(metadata.dimension_order, DimensionOrder::XYCZT);
+            assert!(metadata.is_rgb);
+            assert!(metadata.is_interleaved);
+            assert!(metadata.is_little_endian);
+            assert_eq!(
+                metadata.resolution_count,
+                u32::try_from(resolutions.len()).expect("CZI resolution count fits u32")
+            );
+            if series == 3 {
+                assert_eq!(metadata.pixel_type, PixelType::Uint16);
+                assert_eq!(metadata.bits_per_pixel, 16);
+            } else {
+                assert_eq!(metadata.pixel_type, PixelType::Uint8);
+                assert_eq!(metadata.bits_per_pixel, 8);
+            }
+        }
+    }
+
+    for (series, resolution, expected_len, expected_hash) in [
+        (
+            0,
+            3,
+            19_429_200,
+            "8dcb5189ea141a31259fe798494c42db1dc046e27e45fa34c52547909d798140",
+        ),
+        (
+            0,
+            5,
+            1_213_380,
+            "f806e1f25963535dd96da42861e94218df681d6909b9e781889a8e4d23b4dfbe",
+        ),
+        (
+            1,
+            0,
+            54_695_172,
+            "1fe09e52345f92ea065feda887af538a8ab4b6277e8a1c7e0a946b0a918a013c",
+        ),
+        (
+            1,
+            3,
+            853_224,
+            "7c0fc34e3574bbb9f8fb025cba4c72308c2f5c1f3add379eefb56227c9bd8e97",
+        ),
+        (
+            2,
+            0,
+            988_800,
+            "f02230c0457650da90208d721edaae37cd5dbf5d858d6a9eb473a36bb6948462",
+        ),
+        (
+            3,
+            0,
+            4_649_400,
+            "eaea95595d9c55bbe1b445c2cfdc61a0c3ca2f45da2377b412590735c21bc4bd",
+        ),
+    ] {
+        let plane = dataset
+            .read_plane(
+                ReadRequest::new(series, PlaneCoordinates::default()).with_resolution(resolution),
+            )
+            .expect("decode public JPEG-XR CZI plane");
+        assert_eq!(plane.bytes().len(), expected_len);
+        assert_sha256(plane.bytes(), expected_hash);
+    }
+
+    let region = dataset
+        .read_plane(
+            ReadRequest::new(0, PlaneCoordinates::default()).with_region(Region::Rect(
+                Rect::new(17, 19, 16, 12).expect("valid public CZI region"),
+            )),
+        )
+        .expect("decode bounded native-resolution JPEG-XR CZI region");
+    assert_eq!(region.bytes().len(), 576);
+    assert_sha256(
+        region.bytes(),
+        "a240facb7a0d5897b5826bfa52dee1963929a424e1e2d78dd2f72cd5a85cbcdf",
+    );
+}
+
+#[test]
 #[ignore = "requires the public dt-helix NRRD fixture; see tests/data/README.md"]
 fn nrrd_pixels_match_java_bioformats() {
     let path = fixture("BIOFORMATS_RS_NRRD_FIXTURE");

@@ -22,6 +22,7 @@ pub mod common;
 pub mod dataset;
 pub mod error;
 pub mod formats;
+mod jpegxr;
 pub mod metadata;
 pub mod pattern;
 pub mod pixel;

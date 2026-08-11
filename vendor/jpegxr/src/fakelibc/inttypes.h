@@ -1,0 +1,5 @@
+#define PRIx32 "x"
+#define PRIx64 "lx"
+#define PRIX64 "lX"
+#define PRId64 "ld"
+#define PRIu32 "u"

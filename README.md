@@ -126,5 +126,10 @@ contains a BSD reader module, but selecting only those readers would require a
 separately licensed crate with a clean dependency graph; a Cargo feature alone
 cannot change the license of this crate.
 
+CZI JPEG-XR decoding uses a revision-pinned Rust wrapper around the bundled
+Microsoft JXRLib codec. Building that dependency currently requires a C compiler
+and `libclang` for bindgen. Its permissive license notices are reproduced in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
 No CLI, JSON-RPC protocol, or server lifecycle is part of this crate. Those are
 deployment adapters and remain outside the library interface.

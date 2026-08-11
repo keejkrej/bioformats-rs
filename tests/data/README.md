@@ -20,6 +20,7 @@ Exact public parity fixture variables:
 - `BIOFORMATS_RS_ND2_FINAL_METADATA_FIXTURE`
 - `BIOFORMATS_RS_ND2_BINARY_LV_FIXTURE`
 - `BIOFORMATS_RS_CZI_PUBLIC_FIXTURE`
+- `BIOFORMATS_RS_CZI_JPEGXR_PYRAMID_FIXTURE`
 - `BIOFORMATS_RS_NRRD_FIXTURE`
 - `BIOFORMATS_RS_MRC_FIXTURE`
 - `BIOFORMATS_RS_DCIMG_FIXTURE`
@@ -43,6 +44,11 @@ Public parity fixtures used by `tests/public_parity_gated.rs`:
 - ND2 binary LV acquisition metadata and four-byte scanline padding:
   <https://downloads.openmicroscopy.org/images/ND2/zenodo-17186598/Experiment_0001.nd2>
 - CZI: <https://downloads.openmicroscopy.org/images/Zeiss-CZI/idr0011/Plate1-Blue-A_TS-Stinger/Plate1-Blue-A-02-Scene-1-P2-E1-01.czi>
+- CZI JPEG-XR pyramids, label, and slide preview:
+  <https://openslide.cs.cmu.edu/download/openslide-testdata/Zeiss/Zeiss-5-Cropped.czi>
+  (80,002,752 bytes; SHA-256
+  `6defce5e5507f07d91ecdaa8f2c156026495c8cef9c4ab181fc3f6564629829f`;
+  CC0; credit: Venklab, Pathology, UTHSCSA)
 - NRRD header: <https://downloads.openmicroscopy.org/images/NRRD/gordon/dt-helix.nhdr>
   with sibling `dt-helix.raw`
 - MRC: <https://downloads.openmicroscopy.org/images/MRC/EMDB/EMD-2225/EMD-2225.map>
@@ -59,7 +65,8 @@ first, middle, and last full planes plus the same bounded region. The
 four-byte scanline-padding case exposed by that file. The grouped DCIMG metadata
 and hashes were also captured from Java Bio-Formats 8.5.0 with file grouping
 enabled. The single-plane ND2 fixture necessarily checks its only plane plus a
-region.
+region. The JPEG-XR CZI hierarchy, attachment-series metadata, selected full
+planes, and native-resolution region were captured from Java Bio-Formats 8.5.0.
 
 The three optional local-fixture tests are ignored by default and can be run
 without also selecting the public corpus gates:
