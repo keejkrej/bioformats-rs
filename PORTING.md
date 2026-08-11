@@ -27,19 +27,45 @@ return partially decoded pixels after recognizing a file.
 | Zeiss CZI | GPL | Scenes and other series axes, both split-file naming forms, full-resolution subblocks, typed XML metadata; raw/JPEG/LZW/Zstd-0/Zstd-1 decode paths are implemented, with compressed paths not yet real-fixture verified | Public idr0011 metadata, three planes, and region match Java Bio-Formats 8.3; pyramid blocks are skipped, heterogeneous selected pixel types and non-singleton R/I/H axes fail rather than being collapsed, and per-channel LUTs, JPEG-XR, and complex pixels remain unsupported |
 | NRRD | BSD | Inline or detached raw/gzip data, scalar/vector dimensions, endian and byte-skip handling | Public `dt-helix` metadata, three planes, and region match Java Bio-Formats 8.3 |
 | MRC | GPL | Little/big endian, modes 0/1/2/3/4/6/16, extended headers, IMOD and EMAN conventions | Public `EMD-2225` metadata, three planes, and region match Java Bio-Formats 8.3 |
-| Hamamatsu DCIMG | GPL | Version 0 and version 1 mono8/mono16 frames, footer and row-orientation handling | Public `Cell07` metadata, three planes, and region match Java Bio-Formats 8.3; multi-file Z grouping and timestamps remain unsupported |
+| Hamamatsu DCIMG | GPL | Version 0 and version 1 mono8/mono16 frames, footer and row-orientation handling, plus sorted multi-file Z grouping across filesystem or application-owned sources | Public `Cell07` single-file metadata, three planes, and region match Java Bio-Formats 8.3; generated V0/V1 path and application-source groups prove Z-before-T mapping, de-duplication, direct regions, per-member footer correction, and incompatible-member rejection; the public `bead_bot4_018` group gate covers first/middle/last Z planes against Java Bio-Formats 8.5; grouping is currently automatic because there is no `groupFiles=false` option |
 
 The public fixture URLs and environment variables are recorded in
-`tests/data/README.md`. All twelve public fixture gates across five format
+`tests/data/README.md`. All thirteen public fixture gates across five format
 families are exercised through both the low-level reader and the
 application-facing request API. Fixture-gated tests are ignored in the default
 test run so the repository remains self-contained.
+
+## Remaining gap to Java Bio-Formats
+
+The current Java checkout registers 181 readers and 15 writers. This crate has
+six native reader families and intentionally has no writers. Reader
+registrations are not a one-to-one count of file families—Java has alternate,
+specialized, and TIFF-derived readers—but they still show that breadth is the
+largest gap. Major unimplemented families include Leica LIF/LOF/XLEF,
+Olympus/Evident OIR/FV1000/CellSens, Zeiss LSM/ZVI, Hamamatsu NDPI/VMS,
+DICOM/NIfTI/Imaris/DeltaVision, and high-content screening formats.
+
+Within the six implemented families, CZI is the largest fidelity gap: pyramid
+levels and mosaic tile composition, JPEG-XR, non-singleton R/I/H axes, channel
+LUTs, and heterogeneous pixel types remain unsupported. ND2 still lacks JPEG
+2000, and the TIFF limitations are listed in the matrix above. The metadata
+surface is intentionally focused on pixels, dimensions, channels, physical
+sizes, acquisition timing, and selected annotations rather than Java
+Bio-Formats' full OME metadata graph and service/plugin APIs.
+
+The recommended next large milestone is CZI pyramid and mosaic assembly. It
+requires retaining stored subblock dimensions, modeling resolution levels and
+per-plane tile sets, composing bounded regions with missing-tile fill, and
+adding a Java-valid raw or Zstd pyramid fixture; the readily available public
+pyramidal CZI fixtures assessed for this milestone use the still-unsupported
+JPEG-XR codec.
 
 All six implemented reader families also run through an application-owned
 `RandomAccessSource`: TIFF/OME-TIFF, ND2, CZI, NRRD, MRC, and DCIMG. Integration
 tests record bounded TIFF ranges, reject a source with a malformed declared
 range, share one `Dataset` across threads, resolve detached NRRD data and
-multi-file OME-TIFF by name, and resolve/de-duplicate/order split CZI siblings.
+multi-file OME-TIFF by name, and resolve/de-duplicate/order split CZI and grouped
+DCIMG siblings.
 The filesystem path APIs exercise the same reader code through the built-in
 source and resolver adapters.
 
@@ -78,8 +104,9 @@ bounded read-at operation, length, stable identity, logical name, and thread
 safety. Readers retain source handles and issue range reads without creating
 temporary files or preloading the complete dataset. Resolver `Named` lookups
 cover explicit references (detached NRRD and OME-TIFF); complete `Siblings`
-lookups cover implicit split sets (CZI). `Dataset::used_sources` is authoritative
-for this boundary, while `used_files` intentionally reports only real paths.
+lookups cover implicit split or grouped sets (CZI and DCIMG).
+`Dataset::used_sources` is authoritative for this boundary, while `used_files`
+intentionally reports only real paths.
 
 No implemented reader requires filesystem storage for opening, metadata, or
 pixel reads. Filesystem-specific behavior remains in the convenience path
@@ -87,8 +114,10 @@ adapter and its automatic relative/sibling discovery, persisted reader
 snapshots and memoizer rebinding, and path-oriented helpers such as file-pattern
 stitching. Application-owned sources must be rebound by the application after a
 restart; snapshot requests return `SnapshotUnsupported`. Format gaps in the
-matrix above remain format gaps regardless of storage—for example ND2 JPEG 2000,
-CZI JPEG-XR/pyramids, and DCIMG multi-file Z grouping are still unsupported.
+matrix above remain format gaps regardless of storage—for example ND2 JPEG 2000
+and CZI JPEG-XR/pyramids are still unsupported. DCIMG timestamp extraction is a
+possible beyond-Java enhancement: the reference reader does not currently
+publish those timestamp records.
 
 ## Deliberate non-goals
 

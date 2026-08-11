@@ -23,6 +23,7 @@ Exact public parity fixture variables:
 - `BIOFORMATS_RS_NRRD_FIXTURE`
 - `BIOFORMATS_RS_MRC_FIXTURE`
 - `BIOFORMATS_RS_DCIMG_FIXTURE`
+- `BIOFORMATS_RS_DCIMG_GROUP_FIXTURE`
 
 Public parity fixtures used by `tests/public_parity_gated.rs`:
 
@@ -46,13 +47,19 @@ Public parity fixtures used by `tests/public_parity_gated.rs`:
   with sibling `dt-helix.raw`
 - MRC: <https://downloads.openmicroscopy.org/images/MRC/EMDB/EMD-2225/EMD-2225.map>
 - DCIMG: <https://downloads.openmicroscopy.org/images/DCIMG/zenodo-14281237/Cell07_642_000_000.dcimg>
+- DCIMG multi-file Z stack: download all eleven `.dcimg` members from
+  <https://downloads.openmicroscopy.org/images/DCIMG/zenodo-14268554/bead_bot4_018/>
+  into one directory and point `BIOFORMATS_RS_DCIMG_GROUP_FIXTURE` at any one
+  member.
 
 The original committed hashes were captured from Java Bio-Formats 8.3.0. The
 additional ND2 acquisition-loop fixtures were checked against 8.5.0, including
 first, middle, and last full planes plus the same bounded region. The
 `Experiment_0001` hashes intentionally use 8.5.0: Bio-Formats 8.4 fixed the
-four-byte scanline-padding case exposed by that file. The single-plane ND2
-fixture necessarily checks its only plane plus a region.
+four-byte scanline-padding case exposed by that file. The grouped DCIMG metadata
+and hashes were also captured from Java Bio-Formats 8.5.0 with file grouping
+enabled. The single-plane ND2 fixture necessarily checks its only plane plus a
+region.
 
 The three optional local-fixture tests are ignored by default and can be run
 without also selecting the public corpus gates:

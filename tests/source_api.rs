@@ -491,6 +491,107 @@ fn dcimg_reads_pixels_from_an_application_owned_source() {
 }
 
 #[test]
+fn invalid_dcimg_primary_is_rejected_before_requesting_siblings() {
+    let source = Arc::new(MemorySource::new(
+        "memory:invalid-dcimg",
+        "invalid.dcimg",
+        b"DCIMG".to_vec(),
+    ));
+    let sibling_requests = Arc::new(Mutex::new(0));
+    let resolver = Arc::new(SiblingResolver {
+        siblings: Vec::new(),
+        requests: Arc::clone(&sibling_requests),
+    });
+
+    assert!(matches!(
+        open_source(SourceInput::new(source).with_companion_resolver(resolver)),
+        Err(BioFormatsError::InvalidData(message)) if message.contains("main header")
+    ));
+    assert_eq!(*sibling_requests.lock().expect("sibling requests"), 0);
+}
+
+#[test]
+fn multi_file_dcimg_sources_are_deduplicated_sorted_and_mapped_z_before_t() {
+    let first_bytes = minimal_dcimg([1, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16]);
+    let second_bytes = minimal_dcimg([21, 22, 23, 24, 25, 26, 31, 32, 33, 34, 35, 36]);
+    let first = Arc::new(MemorySource::new(
+        "memory:dcimg-a",
+        "camera-000.dcimg",
+        first_bytes.clone(),
+    ));
+    let second: Arc<dyn RandomAccessSource> = Arc::new(MemorySource::new(
+        "memory:dcimg-b",
+        "./camera-001.dcimg",
+        second_bytes.clone(),
+    ));
+    let primary_alias: Arc<dyn RandomAccessSource> = Arc::new(MemorySource::new(
+        "memory:dcimg-a",
+        "000-primary-alias.dcimg",
+        first_bytes,
+    ));
+    let second_alias: Arc<dyn RandomAccessSource> = Arc::new(MemorySource::new(
+        "memory:dcimg-b",
+        "zzz-second-alias.dcimg",
+        second_bytes,
+    ));
+    let first_as_source: Arc<dyn RandomAccessSource> = first.clone();
+    let sibling_requests = Arc::new(Mutex::new(0));
+    let resolver = Arc::new(SiblingResolver {
+        // Resolver order is intentionally reversed, repeats the primary, and
+        // supplies alternate logical names for both stable identities.
+        siblings: vec![second_alias, primary_alias, second, first_as_source],
+        requests: Arc::clone(&sibling_requests),
+    });
+
+    let dataset = open_source(SourceInput::new(first).with_companion_resolver(resolver))
+        .expect("open grouped DCIMG sources");
+    assert_eq!(*sibling_requests.lock().expect("sibling requests"), 1);
+    assert!(dataset.used_files().is_empty());
+    assert_eq!(
+        dataset
+            .used_sources()
+            .iter()
+            .map(|source| source.identity().as_str())
+            .collect::<Vec<_>>(),
+        ["memory:dcimg-a", "memory:dcimg-b"]
+    );
+    assert_eq!(
+        dataset
+            .used_sources()
+            .iter()
+            .map(SourceInfo::name)
+            .collect::<Vec<_>>(),
+        ["camera-000.dcimg", "./camera-001.dcimg"]
+    );
+
+    let metadata = dataset.series()[0].resolutions()[0].metadata();
+    assert_eq!(
+        (metadata.size_z, metadata.size_t, metadata.image_count),
+        (2, 2, 4)
+    );
+
+    for (coordinates, expected) in [
+        (PlaneCoordinates::new(0, 0, 0), [4, 5, 6, 1, 2, 3]),
+        (PlaneCoordinates::new(1, 0, 0), [24, 25, 26, 21, 22, 23]),
+        (PlaneCoordinates::new(0, 0, 1), [14, 15, 16, 11, 12, 13]),
+        (PlaneCoordinates::new(1, 0, 1), [34, 35, 36, 31, 32, 33]),
+    ] {
+        let plane = dataset
+            .read_plane(ReadRequest::new(0, coordinates))
+            .expect("read grouped DCIMG plane");
+        assert_eq!(plane.bytes(), expected.as_slice());
+    }
+
+    let request = ReadRequest::new(0, PlaneCoordinates::new(1, 0, 1))
+        .with_region(Region::Rect(Rect::new(1, 0, 2, 2).expect("valid region")));
+    let mut destination = [0xaa; 6];
+    dataset
+        .read_plane_into(request, &mut destination)
+        .expect("read grouped DCIMG region into caller buffer");
+    assert_eq!(destination, [35, 36, 32, 33, 0xaa, 0xaa]);
+}
+
+#[test]
 fn nd2_reads_pixels_from_an_application_owned_source() {
     let source = Arc::new(MemorySource::new(
         "memory:nd2",
@@ -674,18 +775,20 @@ fn minimal_mrc(pixels: [u8; 6]) -> Vec<u8> {
     bytes
 }
 
-fn minimal_dcimg(pixels: [u8; 6]) -> Vec<u8> {
+fn minimal_dcimg<const N: usize>(pixels: [u8; N]) -> Vec<u8> {
+    const FRAME_BYTES: usize = 6;
+    assert!(N > 0 && N % FRAME_BYTES == 0);
     let header_size = 128_usize;
     let data_offset = 128_usize;
     let mut bytes = vec![0_u8; header_size + data_offset];
     bytes[..5].copy_from_slice(b"DCIMG");
     put_u32_le(&mut bytes, 8, 0x0100_0000);
     put_u32_le(&mut bytes, 40, header_size as u32);
-    put_i32_le(&mut bytes, header_size + 60, 1);
+    put_i32_le(&mut bytes, header_size + 60, (N / FRAME_BYTES) as i32);
     put_i32_le(&mut bytes, header_size + 64, 1);
     put_i32_le(&mut bytes, header_size + 72, 3);
     put_i32_le(&mut bytes, header_size + 76, 2);
-    put_u32_le(&mut bytes, header_size + 84, pixels.len() as u32);
+    put_u32_le(&mut bytes, header_size + 84, FRAME_BYTES as u32);
     put_i64_le(&mut bytes, header_size + 96, data_offset as i64);
     put_u32_le(&mut bytes, header_size + 124, 0);
     bytes.extend_from_slice(&pixels);

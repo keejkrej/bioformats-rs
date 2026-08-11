@@ -686,3 +686,64 @@ fn dcimg_pixels_match_java_bioformats() {
         "c56e1599719007205d80d3b396b3b026bc1ef746f36a69345dca48f611a7b93c",
     );
 }
+
+#[test]
+#[ignore = "requires the public bead_bot4_018 DCIMG group; see tests/data/README.md"]
+fn grouped_dcimg_z_stack_matches_java_bioformats_8_5() {
+    let path = fixture("BIOFORMATS_RS_DCIMG_GROUP_FIXTURE");
+    let mut reader = ImageReader::open(&path).unwrap();
+    assert_eq!(reader.format(), Some(FormatId::Dcimg));
+    let metadata = reader.metadata();
+    assert_eq!((metadata.size_x, metadata.size_y), (2_048, 200));
+    assert_eq!(
+        (metadata.size_z, metadata.size_c, metadata.size_t),
+        (11, 1, 1)
+    );
+    assert_eq!(metadata.image_count, 11);
+    assert_eq!(metadata.samples_per_pixel, 1);
+    assert_eq!(metadata.pixel_type, PixelType::Uint16);
+    assert_eq!(metadata.bits_per_pixel, 16);
+    assert_eq!(metadata.dimension_order, DimensionOrder::XYZCT);
+    assert!(metadata.is_little_endian);
+    assert_eq!(reader.used_files().len(), 11);
+    assert_eq!(reader.used_sources().len(), 11);
+    for (index, used_file) in reader.used_files().iter().enumerate() {
+        let expected_name = format!("bead_bot4__560_00000_{index:05}.dcimg");
+        assert_eq!(
+            used_file.file_name().and_then(|name| name.to_str()),
+            Some(expected_name.as_str())
+        );
+    }
+
+    for (plane, expected) in [
+        (
+            0,
+            "747cef1be18aecb9d21e74e16a177c0988ce4ffe5df3557e7d52982a82e00da5",
+        ),
+        (
+            5,
+            "c7b3ca237325ac6816835a5c7d46aee92681aec77322fcd0112a71ea4267369a",
+        ),
+        (
+            10,
+            "716e651150df4b99b4c73c7d677dd86184427d7f5a086800a346a09faf2fdcf0",
+        ),
+    ] {
+        let bytes = reader.open_bytes(plane).unwrap();
+        assert_eq!(bytes.len(), 819_200);
+        assert_sha256(&bytes, expected);
+    }
+    let region = reader.open_bytes_region(5, 17, 19, 16, 12).unwrap();
+    assert_eq!(region.len(), 384);
+    assert_sha256(
+        &region,
+        "67bcb14489d1d4151d131ef05ae9d2527069fdf30a93bb097bc3a602d3acd72a",
+    );
+    assert_dataset_request_path(
+        &path,
+        FormatId::Dcimg,
+        5,
+        "c7b3ca237325ac6816835a5c7d46aee92681aec77322fcd0112a71ea4267369a",
+        "67bcb14489d1d4151d131ef05ae9d2527069fdf30a93bb097bc3a602d3acd72a",
+    );
+}

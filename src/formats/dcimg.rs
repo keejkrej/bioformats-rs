@@ -28,7 +28,12 @@
 //! Ported from OME Bio-Formats' `DCIMGReader.java`. The implementation also
 //! incorporates the bounded-region and overflow checks exercised by the
 //! `bioformats-zig` DCIMG reader.
+//!
+//! Like Java Bio-Formats' default grouping mode, sorted sibling DCIMG files are
+//! exposed as Z while frames inside each file are exposed as T.
 
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -87,32 +92,60 @@ struct FourPixelCorrection {
     file_offset: u64,
 }
 
+#[derive(Debug)]
+struct DcimgPart {
+    source: SourceHandle,
+    header: DcimgHeader,
+}
+
 /// Reader for Hamamatsu DCIMG version 0 and version 1 files.
 pub struct DcimgReader {
-    source: Option<SourceHandle>,
+    parts: Vec<DcimgPart>,
     path: Option<PathBuf>,
-    header: Option<DcimgHeader>,
+    used_files: Vec<PathBuf>,
     metadata: Option<ImageMetadata>,
 }
 
 impl DcimgReader {
     pub fn new() -> Self {
         Self {
-            source: None,
+            parts: Vec::new(),
             path: None,
-            header: None,
+            used_files: Vec::new(),
             metadata: None,
         }
-    }
-
-    fn initialized_header(&self) -> Result<DcimgHeader> {
-        self.header.ok_or(BioFormatsError::NotInitialized)
     }
 
     fn initialized_metadata(&self) -> Result<&ImageMetadata> {
         self.metadata
             .as_ref()
             .ok_or(BioFormatsError::NotInitialized)
+    }
+
+    fn plane_source(&self, plane_index: u32) -> Result<(&SourceHandle, DcimgHeader, u32)> {
+        let metadata = self.initialized_metadata()?;
+        if plane_index >= metadata.image_count {
+            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
+        }
+        let (z, c, t) = metadata.get_zct_coords(plane_index);
+        if c != 0 {
+            return Err(invalid_data(format!(
+                "plane {plane_index} mapped to unexpected channel {c}"
+            )));
+        }
+        let z = usize::try_from(z).map_err(|_| invalid_data("Z index does not fit in memory"))?;
+        let part = self
+            .parts
+            .get(z)
+            .ok_or_else(|| invalid_data(format!("plane {plane_index} mapped to missing Z {z}")))?;
+        let header = part.header;
+        if t >= header.frame_count {
+            return Err(invalid_data(format!(
+                "plane {plane_index} mapped to frame {t}, but Z {z} has {} frames",
+                header.frame_count
+            )));
+        }
+        Ok((&part.source, header, t))
     }
 
     fn read_region_into(
@@ -126,11 +159,7 @@ impl DcimgReader {
     ) -> Result<usize> {
         let metadata = self.initialized_metadata()?;
         validate_region(metadata, x, y, width, height)?;
-        if plane_index >= metadata.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-
-        let header = self.initialized_header()?;
+        let (source, header, frame_index) = self.plane_source(plane_index)?;
         let bytes_per_sample = header.bytes_per_sample();
         let source_row_bytes = checked_mul(
             u64::from(header.width),
@@ -142,13 +171,9 @@ impl DcimgReader {
         let output_len = checked_mul(output_row_bytes, u64::from(height), "region byte count")?;
         let output_len = usize_from_u64(output_len, "region byte count")?;
         let output_row_bytes = usize_from_u64(output_row_bytes, "region row byte count")?;
-        let frame_start = header.frame_start(plane_index)?;
+        let frame_start = header.frame_start(frame_index)?;
 
         let output = destination_prefix(destination, output_len)?;
-        let source = self
-            .source
-            .as_ref()
-            .ok_or(BioFormatsError::NotInitialized)?;
 
         // Bio-Formats treats `y` as a row in the stored image and reverses only
         // the requested row window while copying it into the caller's buffer.
@@ -214,10 +239,7 @@ impl DcimgReader {
     ) -> Result<Vec<u8>> {
         let metadata = self.initialized_metadata()?;
         validate_region(metadata, x, y, width, height)?;
-        if plane_index >= metadata.image_count {
-            return Err(BioFormatsError::PlaneOutOfRange(plane_index));
-        }
-        let header = self.initialized_header()?;
+        let (_, header, _) = self.plane_source(plane_index)?;
         let output_len = checked_mul(
             checked_mul(
                 u64::from(width),
@@ -240,6 +262,46 @@ impl Default for DcimgReader {
     }
 }
 
+fn is_dcimg_named(name: &str) -> bool {
+    Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("dcimg"))
+}
+
+fn dcimg_sort_name(name: &str) -> &OsStr {
+    let path = Path::new(name);
+    path.file_name().unwrap_or(path.as_os_str())
+}
+
+fn validate_group_member(
+    primary: DcimgHeader,
+    candidate: DcimgHeader,
+    candidate_name: &str,
+) -> Result<()> {
+    if candidate.version_number != primary.version_number
+        || candidate.width != primary.width
+        || candidate.height != primary.height
+        || candidate.frame_count != primary.frame_count
+        || candidate.pixel_type != primary.pixel_type
+    {
+        return Err(invalid_data(format!(
+            "group member {candidate_name:?} is incompatible with the primary file: expected version {:#010x}, {}x{}, {} frames, {:?}; found version {:#010x}, {}x{}, {} frames, {:?}",
+            primary.version_number,
+            primary.width,
+            primary.height,
+            primary.frame_count,
+            primary.pixel_type,
+            candidate.version_number,
+            candidate.width,
+            candidate.height,
+            candidate.frame_count,
+            candidate.pixel_type,
+        )));
+    }
+    Ok(())
+}
+
 impl FormatReader for DcimgReader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
@@ -256,28 +318,96 @@ impl FormatReader for DcimgReader {
     }
 
     fn set_source(&mut self, input: SourceInput) -> Result<()> {
-        let source = input.primary_handle()?;
-        let mut cursor = source.cursor();
-        let header = parse_header(&mut cursor, source.info().len())?;
-        let path = source.path().map(Path::to_path_buf);
+        let primary = input.primary_handle()?;
+        let primary_identity = primary.info().identity().clone();
+        let path = primary.path().map(Path::to_path_buf);
+        let primary_header = {
+            let mut cursor = primary.cursor();
+            parse_header(&mut cursor, primary.info().len())?
+        };
+
+        let mut siblings = input.resolve_siblings_where(&primary, is_dcimg_named)?;
+
+        // Choose one deterministic logical-name representative for every
+        // sibling identity. The caller's primary handle is retained separately
+        // so an alias returned by the resolver cannot discard its path/name.
+        siblings.sort_by(|left, right| {
+            left.info()
+                .identity()
+                .cmp(right.info().identity())
+                .then_with(|| {
+                    dcimg_sort_name(left.info().name()).cmp(dcimg_sort_name(right.info().name()))
+                })
+                .then_with(|| left.info().name().cmp(right.info().name()))
+        });
+        let mut identities = HashSet::from([primary_identity.clone()]);
+        siblings.retain(|source| identities.insert(source.info().identity().clone()));
+        let mut sources = vec![primary.clone()];
+        sources.extend(siblings);
+
+        let mut dcimg_sources = Vec::new();
+        dcimg_sources
+            .try_reserve_exact(sources.len())
+            .map_err(|error| invalid_data(format!("cannot allocate source list: {error}")))?;
+        for source in sources {
+            let is_primary = source.info().identity() == &primary_identity;
+            if is_primary || source.read_prefix(SIGNATURE.len())?.starts_with(SIGNATURE) {
+                dcimg_sources.push(source);
+            }
+        }
+        dcimg_sources.sort_by(|left, right| {
+            dcimg_sort_name(left.info().name())
+                .cmp(dcimg_sort_name(right.info().name()))
+                .then_with(|| left.info().name().cmp(right.info().name()))
+                .then_with(|| left.info().identity().cmp(right.info().identity()))
+        });
+
+        let mut parts = Vec::new();
+        parts
+            .try_reserve_exact(dcimg_sources.len())
+            .map_err(|error| invalid_data(format!("cannot allocate DCIMG part list: {error}")))?;
+        for source in dcimg_sources {
+            let candidate = if source.info().identity() == &primary_identity {
+                primary_header
+            } else {
+                let mut cursor = source.cursor();
+                parse_header(&mut cursor, source.info().len())?
+            };
+            validate_group_member(primary_header, candidate, source.info().name())?;
+            parts.push(DcimgPart {
+                source,
+                header: candidate,
+            });
+        }
+
+        let header = primary_header;
+        let size_z = u32::try_from(parts.len())
+            .map_err(|_| invalid_data("grouped file count exceeds u32"))?;
+        let image_count = size_z
+            .checked_mul(header.frame_count)
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        let used_files = parts
+            .iter()
+            .filter_map(|part| part.source.path().map(Path::to_path_buf))
+            .collect::<Vec<_>>();
 
         let mut metadata = ImageMetadata {
             size_x: header.width,
             size_y: header.height,
-            size_z: 1,
+            size_z,
             size_c: 1,
             size_t: header.frame_count,
             pixel_type: header.pixel_type,
             bits_per_pixel: (header.bytes_per_sample() * 8) as u8,
             samples_per_pixel: 1,
-            image_count: header.frame_count,
+            image_count,
             dimension_order: DimensionOrder::XYZCT,
             is_rgb: false,
             is_interleaved: false,
             is_indexed: false,
             is_false_color: false,
             is_little_endian: true,
-            used_files: path.iter().cloned().collect(),
+            used_files: used_files.clone(),
             ..ImageMetadata::default()
         };
         metadata.series_metadata.insert(
@@ -285,17 +415,17 @@ impl FormatReader for DcimgReader {
             MetadataValue::Int(i64::from(header.version_number)),
         );
 
-        self.source = Some(source);
+        self.parts = parts;
         self.path = path;
-        self.header = Some(header);
+        self.used_files = used_files;
         self.metadata = Some(metadata);
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.source = None;
+        self.parts.clear();
         self.path = None;
-        self.header = None;
+        self.used_files.clear();
         self.metadata = None;
         Ok(())
     }
@@ -327,13 +457,13 @@ impl FormatReader for DcimgReader {
     }
 
     fn used_files(&self) -> Vec<PathBuf> {
-        self.path.iter().cloned().collect()
+        self.used_files.clone()
     }
 
     fn used_sources(&self) -> Vec<SourceInfo> {
-        self.source
+        self.parts
             .iter()
-            .map(|source| source.info().clone())
+            .map(|part| part.source.info().clone())
             .collect()
     }
 
@@ -736,25 +866,45 @@ mod tests {
 
     static NEXT_TEST_FILE: AtomicU64 = AtomicU64::new(0);
 
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("bioformats-rs-dcimg-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.path.join(name);
+            fs::write(&path, bytes).unwrap();
+            path
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
     struct TestFile {
+        _directory: TestDirectory,
         path: PathBuf,
     }
 
     impl TestFile {
         fn new(bytes: &[u8]) -> Self {
-            let id = NEXT_TEST_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "bioformats-rs-dcimg-{}-{id}.dcimg",
-                std::process::id()
-            ));
-            fs::write(&path, bytes).unwrap();
-            Self { path }
-        }
-    }
-
-    impl Drop for TestFile {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.path);
+            let directory = TestDirectory::new();
+            let path = directory.write("sample.dcimg", bytes);
+            Self {
+                _directory: directory,
+                path,
+            }
         }
     }
 
@@ -899,6 +1049,181 @@ mod tests {
             Err(BioFormatsError::PlaneOutOfRange(2))
         ));
         assert_eq!(reader.used_files(), vec![file.path.clone()]);
+    }
+
+    #[test]
+    fn groups_sorted_files_as_z_before_t_from_either_member() {
+        let directory = TestDirectory::new();
+        let first = directory.write(
+            "camera-000.dcimg",
+            &version_1_file(
+                3,
+                2,
+                PIXEL_MONO8,
+                0,
+                &[&[1, 2, 3, 4, 5, 6], &[11, 12, 13, 14, 15, 16]],
+            ),
+        );
+        let second = directory.write(
+            "camera-001.DCIMG",
+            &version_1_file(
+                3,
+                2,
+                PIXEL_MONO8,
+                0,
+                &[&[21, 22, 23, 24, 25, 26], &[31, 32, 33, 34, 35, 36]],
+            ),
+        );
+        directory.write("not-an-image.dcimg", b"not a DCIMG file");
+
+        for opened_path in [&first, &second] {
+            let mut reader = DcimgReader::new();
+            reader.set_id(opened_path).unwrap();
+
+            assert_eq!(reader.current_file(), Some(opened_path.as_path()));
+            assert_eq!(reader.used_files(), vec![first.clone(), second.clone()]);
+            assert_eq!(
+                reader.metadata().used_files,
+                vec![first.clone(), second.clone()]
+            );
+            assert_eq!(reader.used_sources().len(), 2);
+            assert_eq!(
+                (
+                    reader.metadata().size_z,
+                    reader.metadata().size_t,
+                    reader.metadata().image_count,
+                ),
+                (2, 2, 4)
+            );
+            assert_eq!(reader.open_bytes(0).unwrap(), [4, 5, 6, 1, 2, 3]);
+            assert_eq!(reader.open_bytes(1).unwrap(), [24, 25, 26, 21, 22, 23]);
+            assert_eq!(reader.open_bytes(2).unwrap(), [14, 15, 16, 11, 12, 13]);
+            assert_eq!(reader.open_bytes(3).unwrap(), [34, 35, 36, 31, 32, 33]);
+            assert!(matches!(
+                reader.open_bytes(4),
+                Err(BioFormatsError::PlaneOutOfRange(4))
+            ));
+        }
+    }
+
+    #[test]
+    fn groups_version_0_members_with_per_file_footer_correction() {
+        let directory = TestDirectory::new();
+        let first_frame = (1_u8..=16).collect::<Vec<_>>();
+        let second_frame = (21_u8..=36).collect::<Vec<_>>();
+        let first = directory.write(
+            "camera-000.dcimg",
+            &version_0_file(4, 4, PIXEL_MONO8, &[&first_frame], None),
+        );
+        directory.write(
+            "camera-001.dcimg",
+            &version_0_file(
+                4,
+                4,
+                PIXEL_MONO8,
+                &[&second_frame],
+                Some((2, &[101, 102, 103, 104])),
+            ),
+        );
+
+        let mut reader = DcimgReader::new();
+        reader.set_id(&first).unwrap();
+        assert_eq!(
+            (
+                reader.metadata().size_z,
+                reader.metadata().size_t,
+                reader.metadata().image_count,
+            ),
+            (2, 1, 2)
+        );
+        assert_eq!(
+            reader.open_bytes(1).unwrap(),
+            [33, 34, 35, 36, 29, 30, 31, 32, 101, 102, 103, 104, 21, 22, 23, 24,]
+        );
+    }
+
+    #[test]
+    fn rejects_every_incompatible_group_field_before_pixel_reads() {
+        let incompatible = [
+            (
+                "version",
+                version_0_file(3, 2, PIXEL_MONO8, &[&[1, 2, 3, 4, 5, 6]], None),
+            ),
+            (
+                "width",
+                version_1_file(2, 2, PIXEL_MONO8, 0, &[&[1, 2, 3, 4]]),
+            ),
+            (
+                "height",
+                version_1_file(3, 3, PIXEL_MONO8, 0, &[&[1, 2, 3, 4, 5, 6, 7, 8, 9]]),
+            ),
+            (
+                "frame count",
+                version_1_file(
+                    3,
+                    2,
+                    PIXEL_MONO8,
+                    0,
+                    &[&[1, 2, 3, 4, 5, 6], &[7, 8, 9, 10, 11, 12]],
+                ),
+            ),
+            (
+                "pixel type",
+                version_1_file(
+                    3,
+                    2,
+                    PIXEL_MONO16,
+                    0,
+                    &[&[1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]],
+                ),
+            ),
+        ];
+
+        for (field, candidate) in incompatible {
+            let directory = TestDirectory::new();
+            let primary = directory.write(
+                "camera-000.dcimg",
+                &version_1_file(3, 2, PIXEL_MONO8, 0, &[&[1, 2, 3, 4, 5, 6]]),
+            );
+            directory.write("camera-001.dcimg", &candidate);
+
+            assert!(
+                matches!(
+                    DcimgReader::new().set_id(&primary),
+                    Err(BioFormatsError::InvalidData(message))
+                        if message.contains("group member") && message.contains("incompatible")
+                ),
+                "accepted incompatible DCIMG {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_regroup_preserves_the_initialized_reader() {
+        let valid = TestFile::new(&version_1_file(
+            3,
+            2,
+            PIXEL_MONO8,
+            0,
+            &[&[1, 2, 3, 4, 5, 6]],
+        ));
+        let mut reader = DcimgReader::new();
+        reader.set_id(&valid.path).unwrap();
+
+        let invalid_group = TestDirectory::new();
+        let invalid_primary = invalid_group.write(
+            "camera-000.dcimg",
+            &version_1_file(3, 2, PIXEL_MONO8, 0, &[&[7, 8, 9, 10, 11, 12]]),
+        );
+        invalid_group.write(
+            "camera-001.dcimg",
+            &version_1_file(2, 2, PIXEL_MONO8, 0, &[&[13, 14, 15, 16]]),
+        );
+
+        assert!(reader.set_id(&invalid_primary).is_err());
+        assert_eq!(reader.current_file(), Some(valid.path.as_path()));
+        assert_eq!((reader.metadata().size_z, reader.metadata().size_t), (1, 1));
+        assert_eq!(reader.open_bytes(0).unwrap(), [4, 5, 6, 1, 2, 3]);
     }
 
     #[test]

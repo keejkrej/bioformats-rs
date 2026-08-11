@@ -80,10 +80,15 @@ assert_eq!(sources.len(), 1);
 For detached or split datasets, attach a `CompanionResolver`. `Named` requests
 resolve metadata-declared members such as NRRD data files and OME-TIFF planes;
 `Siblings` requests provide the complete candidate set for convention-based
-datasets such as split CZI. The logical name is a naming and format hint, not a
+datasets such as split CZI and grouped DCIMG Z stacks. DCIMG members are sorted
+by logical filename, de-duplicated by stable identity, and must agree on
+dimensions, frame count, pixel type, and version. As in Java Bio-Formats'
+default grouping mode, every valid `.dcimg` sibling supplied by the resolver is
+considered a Z member. The current API does not expose Java Bio-Formats'
+`groupFiles=false` opt-out. The logical name is a naming and format hint, not a
 filesystem path. The filesystem APIs are adapters over the same source and
-resolver boundary—custom sources are never copied to temporary files or
-silently materialized as one complete byte buffer. See the compiling
+resolver boundary—custom sources are never copied to temporary files or silently
+materialized as one complete byte buffer. See the compiling
 [`application_source` example](examples/application_source.rs) for an adapter to
 an application-owned range store.
 
