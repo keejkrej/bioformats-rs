@@ -131,5 +131,9 @@ Microsoft JXRLib codec. Building that dependency currently requires a C compiler
 and `libclang` for bindgen. Its permissive license notices are reproduced in
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
+Legacy ND2 JPEG 2000 decoding uses the pure-Rust
+`dicom-toolkit-jpeg2000` codec with its optional OpenJPH HTJ2K and SIMD backends
+disabled. Its permissive license notice is reproduced in the same notices file.
+
 No CLI, JSON-RPC protocol, or server lifecycle is part of this crate. Those are
 deployment adapters and remain outside the library interface.

@@ -44,7 +44,7 @@ impl FormatId {
     pub const fn extensions(self) -> &'static [&'static str] {
         match self {
             Self::Tiff => &["tif", "tiff", "tf2", "tf8", "btf", "ome"],
-            Self::Nd2 => &["nd2"],
+            Self::Nd2 => &["nd2", "jp2"],
             Self::Czi => &["czi"],
             Self::Nrrd => &["nrrd", "nhdr"],
             Self::Mrc => &["mrc", "st", "ali", "map", "rec", "mrcs"],

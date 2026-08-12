@@ -23,14 +23,14 @@ return partially decoded pixels after recognizing a file.
 | Family | Java source module | Implemented scope | Verification |
 | --- | --- | --- | --- |
 | TIFF / BigTIFF / OME-TIFF | BSD | Multiple files/series, Java-compatible generic time stacks and heterogeneous-primary splitting, ImageJ scalar/RGB C/Z/T hyperstacks and calibration, OME effective-channel/RGB mapping, unit-normalized metadata and SignificantBits, SubIFD pyramids, chunky or planar strips/tiles, raw/LZW/Deflate/PackBits/JPEG/Zstd for byte-aligned samples, horizontal predictor for 8/16-bit samples, and unsigned packed 1–7/9–15-bit samples expanded without scaling into byte-addressable integer containers | Generated generic and scalar ImageJ stack metadata match Java 8.5 directly for default axes, C/Z/T, and physical/time calibration; native regressions additionally cover both RGB axis branches, strict global first/last comments, mismatch fallback, heterogeneous and incompatible-sample series, reduced-image exclusion, planes, and regions. Generated default, OME RGB/units/bit, pyramid, planar, endian, every packed width, packed strip/tile/layout/lazy application-source, malformed strip/tile metadata, bounded-codec/transform, and overflow tests also pass; legacy missing-IFD raw-tail repair, packed JPEG, signed packed samples, and packed widths above 16 remain unsupported, while FillOrder 2, Predictor 3, WhiteIsZero/CMYK, and non-JPEG YCbCr explicitly error; additional real codec corpus needed |
-| Nikon ND2 | GPL | Chunked files, Nikon LV/text metadata, series and plane maps, shared components, raw/zlib pixels, row padding, indexed channel colors/LUTs, and root-scoped atomic acquisition reconciliation | Eight public fixtures cover scalar/indexed, shared C3, zlib, padded Z/T, NETime, planned spectral loops, stale/final metadata, and binary LV metadata against Java 8.3/8.5; JPEG 2000 explicitly unsupported |
+| Nikon ND2 | GPL | Modern chunked files with Nikon LV/text metadata, series and plane maps, shared components, raw/zlib pixels, row padding, indexed channel colors/LUTs, and root-scoped atomic acquisition reconciliation; legacy JP2-box files with unsigned scalar 8/16-bit JPEG 2000 codestreams, big-endian output, channel planes, and position series | Eight modern public fixtures cover scalar/indexed, shared C3, zlib, padded Z/T, NETime, planned spectral loops, stale/final metadata, and binary LV metadata against Java 8.3/8.5; the public legacy `but3_cont200-1` fixture covers all five series, both channels, metadata, selected full planes, and regions against Java 8.5; generated legacy containers cover 8/16-bit decode, C/series mapping, bounded source reads, snapshots, malformed boxes/SIZ metadata, and codec failures; multi-component/RGB legacy codestreams, JPEG 2000 reference-grid coordinates above 60,000 per axis or 1 GiB decoded, pathological tile grids, and broader legacy metadata variants remain unsupported |
 | Zeiss CZI | GPL | Scenes and other series axes, both split-file naming forms, typed XML metadata, first same-part Label/SlidePreview embedded-CZI attachments, and raw/JPEG/JPEG-XR/LZW/Zstd-0/Zstd-1 subblocks; mosaic tiles and integer-scaled pyramid levels are assembled from logical coordinates while stored dimensions govern decoding, including sparse fill, rounded edge clipping, and intersection-only region reads | Public idr0011 metadata, three planes, and region match Java Bio-Formats 8.3; public `Zeiss-5-Cropped` JPEG-XR pyramid dimensions, selected full planes, native-resolution region, and default attachment series match 8.5; generated Java-readable mosaics cover factor-2/factor-3 levels, negative origins, missing tiles/planes, sparse independent M series, RGB fill/BGR conversion, rounded edges, snapshots, and bounded tile selection; LZW/Zstd pyramids still need real-vendor verification, while per-channel LUTs, complex pixels, incompatible heterogeneous layouts, cross-part and other attachment types, and non-singleton R/I/H axes remain unsupported |
 | NRRD | BSD | Inline or detached raw/gzip data, scalar/vector dimensions, endian and byte-skip handling | Public `dt-helix` metadata, three planes, and region match Java Bio-Formats 8.3 |
 | MRC | GPL | Little/big endian, modes 0/1/2/3/4/6/16, extended headers, IMOD and EMAN conventions | Public `EMD-2225` metadata, three planes, and region match Java Bio-Formats 8.3 |
 | Hamamatsu DCIMG | GPL | Version 0 and version 1 mono8/mono16 frames, footer and row-orientation handling, plus sorted multi-file Z grouping across filesystem or application-owned sources | Public `Cell07` single-file metadata, three planes, and region match Java Bio-Formats 8.3; generated V0/V1 path and application-source groups prove Z-before-T mapping, de-duplication, direct regions, per-member footer correction, and incompatible-member rejection; the public `bead_bot4_018` group gate covers first/middle/last Z planes against Java Bio-Formats 8.5; grouping is currently automatic because there is no `groupFiles=false` option |
 
 The public fixture URLs and environment variables are recorded in
-`tests/data/README.md`. All fourteen public fixture gates across five format
+`tests/data/README.md`. All fifteen public fixture gates across five format
 families are exercised through both the low-level reader and the
 application-facing request API. Fixture-gated tests are ignored in the default
 test run so the repository remains self-contained.
@@ -48,20 +48,22 @@ DICOM/NIfTI/Imaris/DeltaVision, and high-content screening formats.
 Within the six implemented families, the remaining CZI gaps are non-singleton
 R/I/H axes, channel LUTs, incompatible heterogeneous pixel layouts, cross-part
 attachment references and types beyond the first Label/SlidePreview images,
-and broader real-vendor coverage of non-JPEG-XR pyramids. ND2 still lacks JPEG
-2000. Generic TIFF does not implement Java's risky legacy repair that invents
-missing IFDs from trailing uncompressed bytes. Reduced-image primary IFDs are
-excluded from full-resolution stacks but are not currently exposed through the
-thumbnail API; the remaining TIFF codec and transform limitations are listed
-in the matrix above. The metadata surface is intentionally focused on pixels,
+and broader real-vendor coverage of non-JPEG-XR pyramids. ND2 legacy JPEG 2000
+currently covers unsigned scalar codestreams; multi-component/RGB legacy
+codestreams and the full variety of old metadata layouts remain gaps. Generic
+TIFF does not implement Java's risky legacy repair that invents missing IFDs
+from trailing uncompressed bytes. Reduced-image primary IFDs are excluded from
+full-resolution stacks but are not currently exposed through the thumbnail API;
+the remaining TIFF codec and transform limitations are listed in the matrix
+above. The metadata surface is intentionally focused on pixels,
 dimensions, channels, physical sizes,
 acquisition timing, and selected annotations rather than Java Bio-Formats'
 full OME metadata graph and service/plugin APIs.
 
-The recommended next large milestone is ND2 JPEG 2000 decoding plus a public
-compressed-fixture parity gate. It is the remaining explicit codec blocker in
-the ND2 reader and prevents otherwise recognized datasets from returning
-pixels.
+The recommended next large milestone is CZI non-singleton R/I/H axis support
+plus a real public-fixture parity gate. Those dimensions are currently rejected
+before otherwise supported CZI pixel storage can be exposed, and implementing
+them would close the largest remaining structural gap in an existing reader.
 
 All six implemented reader families also run through an application-owned
 `RandomAccessSource`: TIFF/OME-TIFF, ND2, CZI, NRRD, MRC, and DCIMG. Integration
@@ -117,10 +119,10 @@ adapter and its automatic relative/sibling discovery, persisted reader
 snapshots and memoizer rebinding, and path-oriented helpers such as file-pattern
 stitching. Application-owned sources must be rebound by the application after a
 restart; snapshot requests return `SnapshotUnsupported`. Format gaps in the
-matrix above remain format gaps regardless of storage—for example ND2 JPEG 2000
-is still unsupported. DCIMG timestamp extraction is a possible beyond-Java
-enhancement: the reference reader does not currently publish those timestamp
-records.
+matrix above remain format gaps regardless of storage—for example cross-part CZI
+attachments are still unsupported. DCIMG timestamp extraction is a possible
+beyond-Java enhancement: the reference reader does not currently publish those
+timestamp records.
 
 `ReaderSnapshot` serialization is version-bound internal state rather than a
 stable interchange format. The memoizer treats snapshots from an incompatible

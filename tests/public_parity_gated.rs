@@ -483,6 +483,139 @@ fn nd2_binary_lv_and_four_byte_padding_match_java_bioformats_8_5() {
 }
 
 #[test]
+#[ignore = "requires the public legacy JPEG 2000 ND2 fixture; see tests/data/README.md"]
+fn nd2_legacy_jpeg2000_matches_java_bioformats_8_5() {
+    let path = fixture("BIOFORMATS_RS_ND2_JPEG2000_FIXTURE");
+    assert_sha256(
+        &std::fs::read(&path).expect("read public legacy ND2 fixture"),
+        "7e8dcd14c990aae7fe3d3a59be6b7db3f0e45e648948e47d5765ffe9f69003ce",
+    );
+
+    let mut reader = ImageReader::open(&path).expect("open public legacy ND2");
+    assert_eq!(reader.format(), Some(FormatId::Nd2));
+    assert_eq!(reader.series_count(), 5);
+    for series in 0..reader.series_count() {
+        reader.set_series(series).expect("select legacy ND2 series");
+        let metadata = reader.metadata();
+        assert_eq!((metadata.size_x, metadata.size_y), (1_392, 1_040));
+        assert_eq!(
+            (metadata.size_z, metadata.size_c, metadata.size_t),
+            (1, 2, 1)
+        );
+        assert_eq!(metadata.image_count, 2);
+        assert_eq!(metadata.pixel_type, PixelType::Uint16);
+        assert_eq!(metadata.bits_per_pixel, 16);
+        assert_eq!(metadata.samples_per_pixel, 1);
+        assert_eq!(metadata.dimension_order, DimensionOrder::XYCZT);
+        assert!(!metadata.is_little_endian);
+        assert!(!metadata.is_rgb);
+        assert!(!metadata.is_interleaved);
+        assert!(!metadata.is_indexed);
+        assert!(metadata.is_false_color);
+        assert_eq!(metadata.channel_metadata.len(), 2);
+        assert_eq!(
+            metadata.channel_metadata[0].name.as_deref(),
+            Some("20phase")
+        );
+        assert_eq!(metadata.channel_metadata[1].name.as_deref(), Some("20xDiO"));
+        assert_eq!(
+            metadata.channel_metadata[0].emission_wavelength_nm,
+            Some(525.0)
+        );
+        assert_eq!(
+            metadata.channel_metadata[1].emission_wavelength_nm,
+            Some(525.0)
+        );
+    }
+
+    for (series, plane, coordinates, plane_hash, region_hash) in [
+        (
+            0,
+            0,
+            PlaneCoordinates::new(0, 0, 0),
+            "322980605d49e4a27f61cc242e738939634aa397e3c31a2f1607b951b4d74fc7",
+            "9355af65381464351aac09c809822d1d4078357fd60d00dd95e92c4434d67d2d",
+        ),
+        (
+            2,
+            1,
+            PlaneCoordinates::new(0, 1, 0),
+            "f2258eb2a9e901b55f16ed07a9c22d98a23ea6cd4c92c875532ae6d040bdc3e2",
+            "048120c813760b413a483842b79afd05f0fd2c761babe32b954b67fa6936dad9",
+        ),
+        (
+            4,
+            1,
+            PlaneCoordinates::new(0, 1, 0),
+            "84e30588ab8e90e80649cd80b2a000476f67873a9e509e544a431069620ae42f",
+            "19c415314028cebaaa586ba9d67d7209dd0a95182eda9b05018625e8d761f899",
+        ),
+    ] {
+        reader.set_series(series).expect("select parity series");
+        assert_eq!(
+            reader
+                .metadata()
+                .get_index(coordinates.z, coordinates.c, coordinates.t),
+            plane
+        );
+        let full = reader.open_bytes(plane).expect("decode legacy ND2 plane");
+        assert_eq!(full.len(), 2_895_360);
+        assert_sha256(&full, plane_hash);
+        let region = reader
+            .open_bytes_region(plane, 17, 19, 16, 12)
+            .expect("decode legacy ND2 region");
+        assert_eq!(region.len(), 384);
+        assert_sha256(&region, region_hash);
+    }
+
+    let dataset = open(&path).expect("open public legacy ND2 dataset");
+    assert_eq!(dataset.format(), FormatId::Nd2);
+    assert_eq!(dataset.series().len(), 5);
+    for (series, coordinates, plane_hash, region_hash) in [
+        (
+            0,
+            PlaneCoordinates::new(0, 0, 0),
+            "322980605d49e4a27f61cc242e738939634aa397e3c31a2f1607b951b4d74fc7",
+            "9355af65381464351aac09c809822d1d4078357fd60d00dd95e92c4434d67d2d",
+        ),
+        (
+            2,
+            PlaneCoordinates::new(0, 1, 0),
+            "f2258eb2a9e901b55f16ed07a9c22d98a23ea6cd4c92c875532ae6d040bdc3e2",
+            "048120c813760b413a483842b79afd05f0fd2c761babe32b954b67fa6936dad9",
+        ),
+        (
+            4,
+            PlaneCoordinates::new(0, 1, 0),
+            "84e30588ab8e90e80649cd80b2a000476f67873a9e509e544a431069620ae42f",
+            "19c415314028cebaaa586ba9d67d7209dd0a95182eda9b05018625e8d761f899",
+        ),
+    ] {
+        let request = ReadRequest::new(series, coordinates);
+        let full = dataset
+            .read_plane(request)
+            .expect("read legacy Dataset plane");
+        assert_eq!(full.info().byte_len, 2_895_360);
+        assert_sha256(full.bytes(), plane_hash);
+        let mut destination = vec![0xa5; full.info().byte_len + 7];
+        dataset
+            .read_plane_into(request, &mut destination)
+            .expect("read legacy Dataset plane into caller storage");
+        assert_sha256(&destination[..full.info().byte_len], plane_hash);
+        assert_eq!(&destination[full.info().byte_len..], &[0xa5; 7]);
+
+        let region_request = request.with_region(Region::Rect(
+            Rect::new(17, 19, 16, 12).expect("valid public parity region"),
+        ));
+        let region = dataset
+            .read_plane(region_request)
+            .expect("read legacy Dataset region");
+        assert_eq!(region.info().byte_len, 384);
+        assert_sha256(region.bytes(), region_hash);
+    }
+}
+
+#[test]
 #[ignore = "requires the public idr0011 CZI fixture; see tests/data/README.md"]
 fn czi_pixels_match_java_bioformats() {
     let path = fixture("BIOFORMATS_RS_CZI_PUBLIC_FIXTURE");

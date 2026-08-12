@@ -5,10 +5,10 @@
 //! - explicit series and plane maps
 //! - typed metadata extraction from textual ND2 metadata chunks when present
 //!
-//! Compression: raw bytes or zlib. JPEG2000 is detected but not decoded.
+//! Compression: raw bytes, zlib, and legacy JPEG 2000 codestream boxes.
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::common::error::{BioFormatsError, Result};
@@ -19,13 +19,23 @@ use crate::common::pixel_type::PixelType;
 use crate::common::reader::{validate_region, FormatReader};
 use crate::snapshot::ReaderSnapshot;
 use crate::source::{map_source_io_error, SourceHandle, SourceInfo, SourceInput};
+use dicom_toolkit_jpeg2000::{DecodeSettings, Image as Jpeg2000Image};
 use roxmltree::{Document, Node};
 use serde::{Deserialize, Serialize};
 
 pub const ND2_MAGIC: [u8; 4] = [0xDA, 0xCE, 0xBE, 0x0A];
+const JP2_SIGNATURE_BOX: [u8; 12] = [
+    0x00, 0x00, 0x00, 0x0c, b'j', b'P', b' ', b' ', 0x0d, 0x0a, 0x87, 0x0a,
+];
 
 const MAX_CHUNK_NAME_BYTES: u64 = 1024 * 1024;
 const MAX_METADATA_CHUNK_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_LEGACY_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_LEGACY_TOP_LEVEL_BOXES: usize = 1_000_000;
+const MAX_JP2_HEADER_BOXES: usize = 4_096;
+const MAX_JPEG2000_TILES: u64 = 65_536;
+const MAX_JPEG2000_DECODE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_JPEG2000_DIMENSION: u32 = 60_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Nd2Chunk {
@@ -188,6 +198,512 @@ fn detect_jpeg2000(data: &[u8]) -> bool {
         || data.starts_with(&[0x00, 0x00, 0x00, 0x0c, 0x6a, 0x50, 0x20, 0x20])
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Jp2BoxHeader {
+    kind: [u8; 4],
+    data_offset: u64,
+    data_length: u64,
+    end: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyIhdr {
+    width: u32,
+    height: u32,
+    components: u16,
+    storage_bits: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Jpeg2000Header {
+    width: u32,
+    height: u32,
+    components: u16,
+    precision: u8,
+}
+
+struct LegacyNd2 {
+    chunks: Vec<Nd2Chunk>,
+    fragments: Vec<String>,
+    ihdr: LegacyIhdr,
+}
+
+fn read_jp2_box_header<R: Read + Seek>(
+    file: &mut R,
+    position: u64,
+    container_end: u64,
+) -> Result<Option<Jp2BoxHeader>> {
+    if position == container_end {
+        return Ok(None);
+    }
+    let remaining = container_end.checked_sub(position).ok_or_else(|| {
+        BioFormatsError::Format("ND2: JP2 box starts beyond its container".into())
+    })?;
+    if remaining < 8 {
+        return Err(BioFormatsError::Format(format!(
+            "ND2: {remaining} trailing bytes cannot contain a JP2 box header"
+        )));
+    }
+
+    file.seek(SeekFrom::Start(position))?;
+    let mut header = [0_u8; 8];
+    file.read_exact(&mut header)?;
+    let short_length = u32::from_be_bytes(header[..4].try_into().expect("four bytes"));
+    let kind = header[4..8].try_into().expect("four bytes");
+    let (box_length, header_length) = match short_length {
+        0 => (remaining, 8_u64),
+        1 => {
+            if remaining < 16 {
+                return Err(BioFormatsError::Format(
+                    "ND2: truncated extended JP2 box header".into(),
+                ));
+            }
+            let mut extended = [0_u8; 8];
+            file.read_exact(&mut extended)?;
+            (u64::from_be_bytes(extended), 16_u64)
+        }
+        value => (u64::from(value), 8_u64),
+    };
+    if box_length < header_length {
+        return Err(BioFormatsError::Format(format!(
+            "ND2: JP2 box length {box_length} is smaller than its {header_length}-byte header"
+        )));
+    }
+    let end = position
+        .checked_add(box_length)
+        .ok_or_else(|| BioFormatsError::Format("ND2: JP2 box end overflows u64".into()))?;
+    if end > container_end {
+        return Err(BioFormatsError::Format(format!(
+            "ND2: JP2 box ending at {end} exceeds its container ending at {container_end}"
+        )));
+    }
+    let data_offset = position
+        .checked_add(header_length)
+        .ok_or_else(|| BioFormatsError::Format("ND2: JP2 payload offset overflows u64".into()))?;
+    Ok(Some(Jp2BoxHeader {
+        kind,
+        data_offset,
+        data_length: box_length - header_length,
+        end,
+    }))
+}
+
+fn parse_legacy_ihdr<R: Read + Seek>(
+    file: &mut R,
+    parent: Jp2BoxHeader,
+) -> Result<Option<LegacyIhdr>> {
+    let mut position = parent.data_offset;
+    let mut child_count = 0_usize;
+    while let Some(child) = read_jp2_box_header(file, position, parent.end)? {
+        increment_box_count(&mut child_count, MAX_JP2_HEADER_BOXES, "JP2 header child")?;
+        if child.kind == *b"ihdr" {
+            if child.data_length < 14 {
+                return Err(BioFormatsError::Format(
+                    "ND2: legacy JP2 ihdr payload is shorter than 14 bytes".into(),
+                ));
+            }
+            file.seek(SeekFrom::Start(child.data_offset))?;
+            let mut data = [0_u8; 14];
+            file.read_exact(&mut data)?;
+            let height = u32::from_be_bytes(data[0..4].try_into().expect("four bytes"));
+            let width = u32::from_be_bytes(data[4..8].try_into().expect("four bytes"));
+            let components = u16::from_be_bytes(data[8..10].try_into().expect("two bytes"));
+            let bpc = data[10];
+            if width == 0 || height == 0 || components == 0 {
+                return Err(BioFormatsError::Format(
+                    "ND2: legacy JP2 ihdr contains zero dimensions or components".into(),
+                ));
+            }
+            if bpc == 0xff {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "ND2: per-component JP2 bit depths are not supported".into(),
+                ));
+            }
+            if bpc & 0x80 != 0 {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "ND2: signed legacy JPEG 2000 samples are not supported".into(),
+                ));
+            }
+            let storage_bits = (bpc & 0x7f).saturating_add(1);
+            if !matches!(storage_bits, 1..=16) {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "ND2: unsupported {storage_bits}-bit legacy JPEG 2000 storage"
+                )));
+            }
+            if data[11] != 7 {
+                return Err(BioFormatsError::Format(format!(
+                    "ND2: JP2 ihdr declares unsupported compression type {}",
+                    data[11]
+                )));
+            }
+            return Ok(Some(LegacyIhdr {
+                width,
+                height,
+                components,
+                storage_bits,
+            }));
+        }
+        position = child.end;
+    }
+    Ok(None)
+}
+
+fn increment_box_count(box_count: &mut usize, limit: usize, context: &str) -> Result<()> {
+    *box_count = box_count
+        .checked_add(1)
+        .ok_or_else(|| BioFormatsError::InvalidData("ND2: legacy JP2 box count overflow".into()))?;
+    if *box_count > limit {
+        return Err(BioFormatsError::InvalidData(format!(
+            "ND2: legacy container has more than {limit} {context} boxes"
+        )));
+    }
+    Ok(())
+}
+
+fn read_jpeg2000_header<R: Read + Seek>(file: &mut R, chunk: &Nd2Chunk) -> Result<Jpeg2000Header> {
+    if chunk.data_length < 42 {
+        return Err(BioFormatsError::Format(
+            "ND2: JPEG 2000 codestream is too short for its SIZ marker".into(),
+        ));
+    }
+    file.seek(SeekFrom::Start(chunk.data_offset))?;
+    let mut header = [0_u8; 42];
+    file.read_exact(&mut header)?;
+    if !header.starts_with(&[0xff, 0x4f, 0xff, 0x51]) {
+        return Err(BioFormatsError::Format(
+            "ND2: jp2c payload does not start with a JPEG 2000 SOC/SIZ marker".into(),
+        ));
+    }
+    let siz_length = u16::from_be_bytes(header[4..6].try_into().expect("two bytes"));
+    let width_end = u32::from_be_bytes(header[8..12].try_into().expect("four bytes"));
+    let height_end = u32::from_be_bytes(header[12..16].try_into().expect("four bytes"));
+    let width_origin = u32::from_be_bytes(header[16..20].try_into().expect("four bytes"));
+    let height_origin = u32::from_be_bytes(header[20..24].try_into().expect("four bytes"));
+    let tile_width = u32::from_be_bytes(header[24..28].try_into().expect("four bytes"));
+    let tile_height = u32::from_be_bytes(header[28..32].try_into().expect("four bytes"));
+    let tile_origin_x = u32::from_be_bytes(header[32..36].try_into().expect("four bytes"));
+    let tile_origin_y = u32::from_be_bytes(header[36..40].try_into().expect("four bytes"));
+    if width_end > MAX_JPEG2000_DIMENSION || height_end > MAX_JPEG2000_DIMENSION {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "ND2: JPEG 2000 reference grid {width_end}x{height_end} exceeds the safe coordinate limit of {MAX_JPEG2000_DIMENSION} per axis"
+        )));
+    }
+    let width = width_end.checked_sub(width_origin).ok_or_else(|| {
+        BioFormatsError::Format("ND2: JPEG 2000 X origin exceeds its image bound".into())
+    })?;
+    let height = height_end.checked_sub(height_origin).ok_or_else(|| {
+        BioFormatsError::Format("ND2: JPEG 2000 Y origin exceeds its image bound".into())
+    })?;
+    let components = u16::from_be_bytes(header[40..42].try_into().expect("two bytes"));
+    if width == 0 || height == 0 || components == 0 {
+        return Err(BioFormatsError::Format(
+            "ND2: JPEG 2000 SIZ marker contains zero dimensions or components".into(),
+        ));
+    }
+    if width > MAX_JPEG2000_DIMENSION || height > MAX_JPEG2000_DIMENSION {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "ND2: JPEG 2000 dimensions {width}x{height} exceed the decoder limit of {MAX_JPEG2000_DIMENSION} per axis"
+        )));
+    }
+    if tile_width == 0 || tile_height == 0 {
+        return Err(BioFormatsError::Format(
+            "ND2: JPEG 2000 SIZ marker declares a zero tile dimension".into(),
+        ));
+    }
+    if tile_origin_x > width_origin || tile_origin_y > height_origin {
+        return Err(BioFormatsError::Format(
+            "ND2: JPEG 2000 tile origin exceeds the image origin".into(),
+        ));
+    }
+    let tile_span_x = width_end.checked_sub(tile_origin_x).ok_or_else(|| {
+        BioFormatsError::Format("ND2: JPEG 2000 tile X origin exceeds its bound".into())
+    })?;
+    let tile_span_y = height_end.checked_sub(tile_origin_y).ok_or_else(|| {
+        BioFormatsError::Format("ND2: JPEG 2000 tile Y origin exceeds its bound".into())
+    })?;
+    let tiles_x = u64::from(tile_span_x)
+        .checked_add(u64::from(tile_width) - 1)
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?
+        / u64::from(tile_width);
+    let tiles_y = u64::from(tile_span_y)
+        .checked_add(u64::from(tile_height) - 1)
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?
+        / u64::from(tile_height);
+    let tile_count = tiles_x
+        .checked_mul(tiles_y)
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    if tile_count == 0 || tile_count > MAX_JPEG2000_TILES {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "ND2: JPEG 2000 codestream declares {tile_count} tiles; the safe limit is {MAX_JPEG2000_TILES}"
+        )));
+    }
+    let tile_grid_end_x = u64::from(tile_origin_x)
+        .checked_add(
+            tiles_x
+                .checked_mul(u64::from(tile_width))
+                .ok_or(BioFormatsError::PlaneByteCountOverflow)?,
+        )
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    let tile_grid_end_y = u64::from(tile_origin_y)
+        .checked_add(
+            tiles_y
+                .checked_mul(u64::from(tile_height))
+                .ok_or(BioFormatsError::PlaneByteCountOverflow)?,
+        )
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    if tile_grid_end_x > u64::from(u32::MAX) || tile_grid_end_y > u64::from(u32::MAX) {
+        return Err(BioFormatsError::UnsupportedFormat(
+            "ND2: JPEG 2000 tile grid coordinates overflow u32".into(),
+        ));
+    }
+    let expected_siz_length = 38_u32
+        .checked_add(
+            u32::from(components)
+                .checked_mul(3)
+                .ok_or(BioFormatsError::PlaneByteCountOverflow)?,
+        )
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    if u32::from(siz_length) != expected_siz_length {
+        return Err(BioFormatsError::Format(format!(
+            "ND2: JPEG 2000 SIZ length {siz_length} does not match {components} components"
+        )));
+    }
+    let total_header = 42_u64
+        .checked_add(u64::from(components) * 3)
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    if total_header > chunk.data_length {
+        return Err(BioFormatsError::Format(
+            "ND2: truncated JPEG 2000 component size records".into(),
+        ));
+    }
+
+    let mut precision = None;
+    for _ in 0..components {
+        let mut component = [0_u8; 3];
+        file.read_exact(&mut component)?;
+        if component[0] & 0x80 != 0 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ND2: signed legacy JPEG 2000 samples are not supported".into(),
+            ));
+        }
+        let component_precision = (component[0] & 0x7f).saturating_add(1);
+        if !(1..=16).contains(&component_precision) {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "ND2: unsupported {component_precision}-bit JPEG 2000 component"
+            )));
+        }
+        if component[1] != 1 || component[2] != 1 {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ND2: subsampled legacy JPEG 2000 components are not supported".into(),
+            ));
+        }
+        match precision {
+            None => precision = Some(component_precision),
+            Some(first) if first == component_precision => {}
+            Some(_) => {
+                return Err(BioFormatsError::UnsupportedFormat(
+                    "ND2: mixed JPEG 2000 component precisions are not supported".into(),
+                ))
+            }
+        }
+    }
+
+    let bytes_per_sample = if precision.expect("nonzero component count") <= 8 {
+        1_u64
+    } else {
+        2_u64
+    };
+    let decoded_bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|value| value.checked_mul(u64::from(components)))
+        .and_then(|value| value.checked_mul(bytes_per_sample))
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    if decoded_bytes > MAX_JPEG2000_DECODE_BYTES {
+        return Err(BioFormatsError::UnsupportedFormat(format!(
+            "ND2: JPEG 2000 plane needs {decoded_bytes} decoded bytes; the safe limit is {MAX_JPEG2000_DECODE_BYTES}"
+        )));
+    }
+
+    Ok(Jpeg2000Header {
+        width,
+        height,
+        components,
+        precision: precision.expect("nonzero component count"),
+    })
+}
+
+fn sanitize_legacy_xml(data: &[u8]) -> Result<Option<String>> {
+    let Some(start) = data.iter().position(|byte| *byte == b'<') else {
+        return Ok(None);
+    };
+    let Some(end) = data.iter().rposition(|byte| *byte == b'>') else {
+        return Ok(None);
+    };
+    if end < start {
+        return Ok(None);
+    }
+    let xml = &data[start..=end];
+    let maximum_utf8_bytes = xml
+        .len()
+        .checked_mul(2)
+        .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+    let mut fragment = String::new();
+    fragment
+        .try_reserve_exact(maximum_utf8_bytes)
+        .map_err(|error| {
+            BioFormatsError::InvalidData(format!(
+                "ND2: cannot allocate sanitized legacy XML: {error}"
+            ))
+        })?;
+    let mut index = 0_usize;
+    while index < xml.len() {
+        let remaining = &xml[index..];
+        if let Some(comment) = remaining.strip_prefix(b"<!--") {
+            let Some(end) = comment.windows(3).position(|window| window == b"-->") else {
+                break;
+            };
+            index = index
+                .checked_add(4 + end + 3)
+                .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+            continue;
+        }
+        if let Some(declaration) = remaining.strip_prefix(b"<?xml") {
+            let Some(end) = declaration.windows(2).position(|window| window == b"?>") else {
+                break;
+            };
+            index = index
+                .checked_add(5 + end + 2)
+                .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+            continue;
+        }
+        let byte = xml[index];
+        fragment.push(match byte {
+            b'\t' | b'\n' | b'\r' | 0x20..=0xff => char::from(byte),
+            _ => ' ',
+        });
+        index += 1;
+    }
+    Ok((!fragment.trim().is_empty()).then_some(fragment))
+}
+
+fn parse_legacy_nd2<R: Read + Seek>(file: &mut R, file_len: u64) -> Result<LegacyNd2> {
+    if file_len < JP2_SIGNATURE_BOX.len() as u64 {
+        return Err(BioFormatsError::Format(
+            "ND2: legacy JP2 container is shorter than its signature box".into(),
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut signature = [0_u8; JP2_SIGNATURE_BOX.len()];
+    file.read_exact(&mut signature)?;
+    if signature != JP2_SIGNATURE_BOX {
+        return Err(BioFormatsError::Format(
+            "ND2: invalid legacy JP2 signature box".into(),
+        ));
+    }
+
+    let mut position = 0_u64;
+    let mut chunks = Vec::new();
+    let mut fragments = Vec::new();
+    let mut ihdr = None;
+    let mut box_count = 0_usize;
+    let mut metadata_bytes = 0_u64;
+    while let Some(jp2_box) = read_jp2_box_header(file, position, file_len)? {
+        increment_box_count(&mut box_count, MAX_LEGACY_TOP_LEVEL_BOXES, "top-level")?;
+        match &jp2_box.kind {
+            b"jp2h" => {
+                let candidate = parse_legacy_ihdr(file, jp2_box)?;
+                if let Some(candidate) = candidate {
+                    match ihdr {
+                        None => ihdr = Some(candidate),
+                        Some(existing) if existing == candidate => {}
+                        Some(_) => {
+                            return Err(BioFormatsError::Format(
+                                "ND2: conflicting legacy JP2 ihdr boxes".into(),
+                            ))
+                        }
+                    }
+                }
+            }
+            b"jp2c" => {
+                chunks.try_reserve(1).map_err(|error| {
+                    BioFormatsError::InvalidData(format!(
+                        "ND2: cannot allocate legacy codestream index: {error}"
+                    ))
+                })?;
+                chunks.push(Nd2Chunk {
+                    name: format!("jp2c|{}", chunks.len()),
+                    data_offset: jp2_box.data_offset,
+                    data_length: jp2_box.data_length,
+                });
+            }
+            b"xml " => {
+                metadata_bytes = metadata_bytes
+                    .checked_add(jp2_box.data_length)
+                    .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+                if metadata_bytes > MAX_LEGACY_METADATA_BYTES {
+                    return Err(BioFormatsError::InvalidData(format!(
+                        "ND2: legacy metadata exceeds {MAX_LEGACY_METADATA_BYTES} bytes"
+                    )));
+                }
+                let length = usize::try_from(jp2_box.data_length)
+                    .map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+                let mut data = allocate_bytes(length, "legacy ND2 XML metadata")?;
+                file.seek(SeekFrom::Start(jp2_box.data_offset))?;
+                file.read_exact(&mut data)?;
+                if let Some(fragment) = sanitize_legacy_xml(&data)? {
+                    fragments.try_reserve(1).map_err(|error| {
+                        BioFormatsError::InvalidData(format!(
+                            "ND2: cannot allocate legacy metadata index: {error}"
+                        ))
+                    })?;
+                    fragments.push(fragment);
+                }
+            }
+            _ => {}
+        }
+        position = jp2_box.end;
+    }
+
+    let ihdr = ihdr.ok_or_else(|| {
+        BioFormatsError::Format("ND2: legacy JP2 container has no ihdr box".into())
+    })?;
+    let first_chunk = chunks.first().ok_or_else(|| {
+        BioFormatsError::Format("ND2: legacy JP2 container has no jp2c boxes".into())
+    })?;
+    let codestream_header = read_jpeg2000_header(file, first_chunk)?;
+    if codestream_header.width != ihdr.width
+        || codestream_header.height != ihdr.height
+        || codestream_header.components != ihdr.components
+        || codestream_header.precision != ihdr.storage_bits
+    {
+        return Err(BioFormatsError::Format(format!(
+            "ND2: JP2 ihdr {}x{}/C{}/{}-bit disagrees with codestream {}x{}/C{}/{}-bit",
+            ihdr.width,
+            ihdr.height,
+            ihdr.components,
+            ihdr.storage_bits,
+            codestream_header.width,
+            codestream_header.height,
+            codestream_header.components,
+            codestream_header.precision
+        )));
+    }
+    for chunk in chunks.iter().skip(1) {
+        let header = read_jpeg2000_header(file, chunk)?;
+        if header != codestream_header {
+            return Err(BioFormatsError::UnsupportedFormat(
+                "ND2: legacy JPEG 2000 codestreams have heterogeneous image layouts".into(),
+            ));
+        }
+    }
+
+    Ok(LegacyNd2 {
+        chunks,
+        fragments,
+        ihdr,
+    })
+}
+
 fn image_sequence_number(name: &str) -> Option<u32> {
     name.strip_prefix("ImageDataSeq|")?
         .strip_suffix('!')?
@@ -230,6 +746,7 @@ struct Nd2MetadataModel {
 enum Nd2Compression {
     Raw,
     Zlib,
+    Jpeg2000,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -877,6 +1394,25 @@ fn collect_text_values(document: &Document<'_>, names: &[&str]) -> Vec<String> {
         .collect()
 }
 
+fn collect_legacy_emission_centers(document: &Document<'_>) -> Vec<f64> {
+    document
+        .descendants()
+        .filter(|node| node.is_element() && node.tag_name().name() == "m_EmissionSpectrum")
+        .filter_map(|spectrum| {
+            let wavelengths = spectrum
+                .descendants()
+                .filter(|node| node.is_element() && node.tag_name().name() == "uiWavelength")
+                .filter_map(xml_node_value)
+                .filter_map(|value| value.parse::<f64>().ok())
+                .filter(|value| *value > 0.0)
+                .collect::<Vec<_>>();
+            let minimum = wavelengths.iter().copied().reduce(f64::min)?;
+            let maximum = wavelengths.iter().copied().reduce(f64::max)?;
+            Some((minimum + maximum) / 2.0)
+        })
+        .collect()
+}
+
 fn xml_node_value<'a, 'input>(node: Node<'a, 'input>) -> Option<&'a str> {
     node.attribute("value")
         .or_else(|| node.text())
@@ -1128,9 +1664,10 @@ fn parse_nd2_text_metadata(fragments: &[String]) -> Nd2MetadataModel {
         .and_then(|value| value.parse::<u32>().ok());
     metadata.row_bytes =
         first_text_value(&document, &["uiWidthBytes"]).and_then(|value| value.parse::<u32>().ok());
-    metadata.logical_channels = first_text_value(&document, &["ChannelCount", "uiComp"])
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|value| *value > 0);
+    metadata.logical_channels =
+        first_text_value(&document, &["ChannelCount", "uiComp", "VirtualComponents"])
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|value| *value > 0);
     metadata.size_z = first_text_value(&document, &["zCount", "uiZStackHome"])
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
@@ -1188,10 +1725,13 @@ fn parse_nd2_text_metadata(fragments: &[String]) -> Nd2MetadataModel {
         .into_iter()
         .filter_map(|value| value.parse::<f64>().ok())
         .collect::<Vec<_>>();
-    let emission = collect_text_values(&document, &["EmissionWavelength", "EmWavelength"])
+    let mut emission = collect_text_values(&document, &["EmissionWavelength", "EmWavelength"])
         .into_iter()
         .filter_map(|value| value.parse::<f64>().ok())
         .collect::<Vec<_>>();
+    if emission.is_empty() {
+        emission = collect_legacy_emission_centers(&document);
+    }
     let channel_count = metadata.logical_channels.unwrap_or(0) as usize;
     let channel_len = channel_count
         .max(names.len())
@@ -1294,6 +1834,41 @@ fn reconcile_acquisition_dimensions(
     }
 }
 
+fn legacy_dimension_order(
+    model: &Nd2MetadataModel,
+    logical_channels: u32,
+    size_z: u32,
+    size_t: u32,
+) -> DimensionOrder {
+    let z_position = model
+        .acquisition_order
+        .iter()
+        .position(|axis| *axis == Nd2Axis::Z);
+    let t_position = model
+        .acquisition_order
+        .iter()
+        .position(|axis| *axis == Nd2Axis::T);
+    let time_before_z = matches!((t_position, z_position), (Some(t), Some(z)) if t < z);
+    if logical_channels > 1 {
+        if size_t > 1 && (size_z == 1 || time_before_z) {
+            DimensionOrder::XYCTZ
+        } else {
+            DimensionOrder::XYCZT
+        }
+    } else if size_t > 1
+        && (size_z == 1 || time_before_z || (t_position.is_some() && z_position.is_none()))
+    {
+        DimensionOrder::XYTZC
+    } else if size_z > 1
+        && size_t > 1
+        && matches!((z_position, t_position), (Some(z), Some(t)) if z < t)
+    {
+        DimensionOrder::XYZTC
+    } else {
+        DimensionOrder::XYZCT
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Nd2Plane {
     chunk_index: usize,
@@ -1307,6 +1882,7 @@ pub struct Nd2Series {
     stored_components: u32,
     row_bytes: usize,
     compression: Option<Nd2Compression>,
+    data_prefix_bytes: u8,
 }
 
 pub struct Nd2Reader {
@@ -1386,14 +1962,102 @@ fn decompress_zlib_limited(data: &[u8], maximum_length: usize) -> Result<Vec<u8>
     Ok(output)
 }
 
-fn decode_physical_plane(data: &[u8], series: &Nd2Series) -> Result<Vec<u8>> {
-    let payload = data.get(8..).ok_or_else(|| {
-        BioFormatsError::Format("ND2: ImageDataSeq payload is missing its 8-byte prefix".into())
+fn decode_jpeg2000_plane(payload: &[u8], series: &Nd2Series) -> Result<Vec<u8>> {
+    let chunk = Nd2Chunk {
+        name: "decoded jp2c".into(),
+        data_offset: 0,
+        data_length: u64::try_from(payload.len())
+            .map_err(|_| BioFormatsError::PlaneByteCountOverflow)?,
+    };
+    let header = read_jpeg2000_header(&mut Cursor::new(payload), &chunk)?;
+    if header.width != series.metadata.size_x
+        || header.height != series.metadata.size_y
+        || u32::from(header.components) != series.stored_components
+    {
+        return Err(BioFormatsError::InvalidData(format!(
+            "ND2: JPEG 2000 header {}x{}/C{} disagrees with series {}x{}/C{}",
+            header.width,
+            header.height,
+            header.components,
+            series.metadata.size_x,
+            series.metadata.size_y,
+            series.stored_components
+        )));
+    }
+    let expected_storage_bits = u8::try_from(
+        series
+            .metadata
+            .pixel_type
+            .bytes_per_sample()
+            .checked_mul(8)
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?,
+    )
+    .map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+    if header.precision != expected_storage_bits {
+        return Err(BioFormatsError::InvalidData(format!(
+            "ND2: JPEG 2000 precision {} disagrees with {}-bit series storage",
+            header.precision, expected_storage_bits
+        )));
+    }
+
+    let image = Jpeg2000Image::new(payload, &DecodeSettings::default()).map_err(|error| {
+        BioFormatsError::Codec(format!("ND2 JPEG 2000 header decode failed: {error}"))
     })?;
-    if detect_jpeg2000(payload) {
-        return Err(BioFormatsError::UnsupportedFormat(
-            "ND2: JPEG2000 compression not yet supported".into(),
+    if image.width() != series.metadata.size_x
+        || image.height() != series.metadata.size_y
+        || image.original_bit_depth() != expected_storage_bits
+    {
+        return Err(BioFormatsError::InvalidData(
+            "ND2: JPEG 2000 decoder header disagrees with the validated codestream".into(),
         ));
+    }
+    let mut bitmap = image.decode_native().map_err(|error| {
+        BioFormatsError::Codec(format!("ND2 JPEG 2000 decompression failed: {error}"))
+    })?;
+    if bitmap.width != series.metadata.size_x
+        || bitmap.height != series.metadata.size_y
+        || u32::from(bitmap.num_components) != series.stored_components
+        || bitmap.bit_depth != expected_storage_bits
+        || usize::from(bitmap.bytes_per_sample) != series.metadata.pixel_type.bytes_per_sample()
+    {
+        return Err(BioFormatsError::InvalidData(format!(
+            "ND2: JPEG 2000 decoder returned {}x{}/C{}/{}-bit/{}-byte samples",
+            bitmap.width,
+            bitmap.height,
+            bitmap.num_components,
+            bitmap.bit_depth,
+            bitmap.bytes_per_sample
+        )));
+    }
+    let expected_length = checked_plane_size(
+        series.metadata.size_x,
+        series.metadata.size_y,
+        series.stored_components,
+        series.metadata.pixel_type.bytes_per_sample(),
+    )?;
+    if bitmap.data.len() != expected_length {
+        return Err(BioFormatsError::InvalidData(format!(
+            "ND2: JPEG 2000 decoder returned {} bytes; expected {expected_length}",
+            bitmap.data.len()
+        )));
+    }
+    if !series.metadata.is_little_endian && bitmap.bytes_per_sample == 2 {
+        for sample in bitmap.data.chunks_exact_mut(2) {
+            sample.swap(0, 1);
+        }
+    }
+    Ok(bitmap.data)
+}
+
+fn decode_physical_plane(data: &[u8], series: &Nd2Series) -> Result<Vec<u8>> {
+    let prefix = usize::from(series.data_prefix_bytes);
+    let payload = data.get(prefix..).ok_or_else(|| {
+        BioFormatsError::Format(format!(
+            "ND2: pixel payload is missing its {prefix}-byte prefix"
+        ))
+    })?;
+    if series.compression == Some(Nd2Compression::Jpeg2000) || detect_jpeg2000(payload) {
+        return decode_jpeg2000_plane(payload, series);
     }
 
     let height = usize::try_from(series.metadata.size_y)
@@ -1931,9 +2595,221 @@ impl Nd2Reader {
                 stored_components: logical_channels,
                 row_bytes,
                 compression: model.compression,
+                data_prefix_bytes: 8,
             });
         }
 
+        Ok(series)
+    }
+
+    fn build_legacy_series(
+        model: &Nd2MetadataModel,
+        image_chunks: &[usize],
+        ihdr: LegacyIhdr,
+    ) -> Result<Vec<Nd2Series>> {
+        if ihdr.components != 1 {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "ND2: legacy JPEG 2000 images with {} stored components are not yet supported",
+                ihdr.components
+            )));
+        }
+        let logical_channels = model.logical_channels.unwrap_or(1).max(1);
+        let size_z = model.size_z.unwrap_or(1).max(1);
+        let size_t = model.size_t.unwrap_or(1).max(1);
+        let series_count = model.series_count.unwrap_or(1).max(1);
+        let image_count = size_z
+            .checked_mul(logical_channels)
+            .and_then(|count| count.checked_mul(size_t))
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        let expected_codestreams = image_count
+            .checked_mul(series_count)
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        if usize::try_from(expected_codestreams)
+            .map_err(|_| BioFormatsError::PlaneByteCountOverflow)?
+            != image_chunks.len()
+        {
+            return Err(BioFormatsError::UnsupportedFormat(format!(
+                "ND2: legacy metadata describes {expected_codestreams} channel planes but the file contains {} jp2c boxes",
+                image_chunks.len()
+            )));
+        }
+        let pixel_type = match ihdr.storage_bits {
+            8 => PixelType::Uint8,
+            16 => PixelType::Uint16,
+            bits => {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                "ND2: Java-compatible legacy JPEG 2000 mapping does not support {bits}-bit storage"
+            )))
+            }
+        };
+        let bits_per_pixel = model.significant_bits.unwrap_or(ihdr.storage_bits);
+        if bits_per_pixel == 0 || bits_per_pixel > ihdr.storage_bits {
+            return Err(BioFormatsError::Format(format!(
+                "ND2: invalid legacy significant bit count {bits_per_pixel} for {}-bit storage",
+                ihdr.storage_bits
+            )));
+        }
+        let row_bytes = usize::try_from(ihdr.width)
+            .ok()
+            .and_then(|width| width.checked_mul(pixel_type.bytes_per_sample()))
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        row_bytes
+            .checked_mul(ihdr.height as usize)
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        let series_len =
+            usize::try_from(series_count).map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+        let plane_len =
+            usize::try_from(image_count).map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+        let mut plane_maps = Vec::new();
+        plane_maps.try_reserve_exact(series_len).map_err(|error| {
+            BioFormatsError::InvalidData(format!("ND2: cannot allocate legacy series map: {error}"))
+        })?;
+        for _ in 0..series_len {
+            let mut planes = Vec::new();
+            planes.try_reserve_exact(plane_len).map_err(|error| {
+                BioFormatsError::InvalidData(format!(
+                    "ND2: cannot allocate legacy plane map: {error}"
+                ))
+            })?;
+            planes.resize(plane_len, None);
+            plane_maps.push(planes);
+        }
+
+        let planes_per_time = size_z
+            .checked_mul(logical_channels)
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        let codestreams_per_time = planes_per_time
+            .checked_mul(series_count)
+            .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+        for (sequence, chunk_index) in image_chunks.iter().copied().enumerate() {
+            let sequence =
+                u32::try_from(sequence).map_err(|_| BioFormatsError::PlaneByteCountOverflow)?;
+            let t = sequence / codestreams_per_time;
+            let within_time = sequence % codestreams_per_time;
+            let series_index = within_time / planes_per_time;
+            let q = within_time % planes_per_time;
+            let z = q / logical_channels;
+            let c = q % logical_channels;
+            let logical_index = c
+                .checked_add(
+                    logical_channels
+                        .checked_mul(
+                            z.checked_add(
+                                size_z
+                                    .checked_mul(t)
+                                    .ok_or(BioFormatsError::PlaneByteCountOverflow)?,
+                            )
+                            .ok_or(BioFormatsError::PlaneByteCountOverflow)?,
+                        )
+                        .ok_or(BioFormatsError::PlaneByteCountOverflow)?,
+                )
+                .ok_or(BioFormatsError::PlaneByteCountOverflow)?;
+            let slot = plane_maps
+                .get_mut(series_index as usize)
+                .and_then(|planes| planes.get_mut(logical_index as usize))
+                .ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "ND2: legacy acquisition loop maps outside its series".into(),
+                    )
+                })?;
+            if slot.is_some() {
+                return Err(BioFormatsError::Format(
+                    "ND2: legacy acquisition loop maps multiple codestreams to one plane".into(),
+                ));
+            }
+            *slot = Some(Nd2Plane {
+                chunk_index,
+                component: 0,
+            });
+        }
+
+        let dimension_order = legacy_dimension_order(model, logical_channels, size_z, size_t);
+        let mut series = Vec::new();
+        series.try_reserve_exact(series_len).map_err(|error| {
+            BioFormatsError::InvalidData(format!(
+                "ND2: cannot allocate legacy series metadata: {error}"
+            ))
+        })?;
+        for (series_index, plane_map) in plane_maps.into_iter().enumerate() {
+            let planes = plane_map
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    BioFormatsError::Format(
+                        "ND2: legacy acquisition loop left logical planes unmapped".into(),
+                    )
+                })?;
+            let mut metadata = ImageMetadata {
+                size_x: ihdr.width,
+                size_y: ihdr.height,
+                size_z,
+                size_c: logical_channels,
+                size_t,
+                pixel_type,
+                bits_per_pixel,
+                samples_per_pixel: 1,
+                image_count,
+                dimension_order,
+                is_rgb: false,
+                is_interleaved: false,
+                is_indexed: false,
+                is_false_color: true,
+                is_little_endian: false,
+                resolution_count: 1,
+                series_metadata: HashMap::new(),
+                lookup_table: None,
+                physical_size_x_um: model.physical_size_x_um,
+                physical_size_y_um: model.physical_size_y_um,
+                physical_size_z_um: model.physical_size_z_um,
+                time_increment_seconds: model.time_increment_seconds,
+                acquisition_timestamp: None,
+                objective_model: model.objective_model.clone(),
+                objective_magnification: model.objective_magnification,
+                objective_na: None,
+                channel_metadata: if model.channel_metadata.len() >= logical_channels as usize {
+                    model.channel_metadata[..logical_channels as usize].to_vec()
+                } else {
+                    model.channel_metadata.clone()
+                },
+                plane_metadata: Vec::new(),
+                used_files: Vec::new(),
+            };
+            metadata
+                .series_metadata
+                .insert("nd2_legacy_jpeg2000".into(), MetadataValue::Bool(true));
+            metadata.series_metadata.insert(
+                "nd2_series_index".into(),
+                MetadataValue::Int(series_index as i64),
+            );
+            metadata.series_metadata.insert(
+                "nd2_codestreams".into(),
+                MetadataValue::Int(planes.len() as i64),
+            );
+            metadata.plane_metadata = (0..image_count)
+                .map(|plane_index| {
+                    let (z, c, t) = metadata.get_zct_coords(plane_index);
+                    PlaneMetadata {
+                        z,
+                        c,
+                        t,
+                        delta_t_seconds: model.timepoints_seconds.get(t as usize).copied().or_else(
+                            || metadata.time_increment_seconds.map(|step| step * t as f64),
+                        ),
+                        position_x_um: model.positions_x_um.get(series_index).copied(),
+                        position_y_um: model.positions_y_um.get(series_index).copied(),
+                        position_z_um: model.positions_z_um.get(z as usize).copied(),
+                    }
+                })
+                .collect();
+            series.push(Nd2Series {
+                metadata,
+                planes,
+                stored_components: 1,
+                row_bytes,
+                compression: Some(Nd2Compression::Jpeg2000),
+                data_prefix_bytes: 0,
+            });
+        }
         Ok(series)
     }
 
@@ -1954,12 +2830,14 @@ impl FormatReader for Nd2Reader {
     fn is_this_type_by_name(&self, path: &Path) -> bool {
         path.extension()
             .and_then(|extension| extension.to_str())
-            .map(|extension| extension.eq_ignore_ascii_case("nd2"))
+            .map(|extension| {
+                extension.eq_ignore_ascii_case("nd2") || extension.eq_ignore_ascii_case("jp2")
+            })
             .unwrap_or(false)
     }
 
     fn is_this_type_by_bytes(&self, header: &[u8]) -> bool {
-        header.starts_with(&ND2_MAGIC)
+        header.starts_with(&ND2_MAGIC) || header.starts_with(&JP2_SIGNATURE_BOX)
     }
 
     fn set_id(&mut self, path: &Path) -> Result<()> {
@@ -1969,6 +2847,62 @@ impl FormatReader for Nd2Reader {
     fn set_source(&mut self, input: SourceInput) -> Result<()> {
         let source = input.primary_handle()?;
         let mut reader = BufReader::new(source.cursor());
+        let mut signature = [0_u8; JP2_SIGNATURE_BOX.len()];
+        let signature_length = usize::try_from(source.info().len())
+            .unwrap_or(usize::MAX)
+            .min(signature.len());
+        reader.read_exact(&mut signature[..signature_length])?;
+        reader.seek(SeekFrom::Start(0))?;
+        if signature_length == signature.len() && signature == JP2_SIGNATURE_BOX {
+            let legacy = parse_legacy_nd2(&mut reader, source.info().len())?;
+            let mut metadata = parse_nd2_text_metadata(&legacy.fragments);
+            metadata.size_x = Some(legacy.ihdr.width);
+            metadata.size_y = Some(legacy.ihdr.height);
+            metadata.storage_bits = Some(legacy.ihdr.storage_bits);
+            // Bio-Formats recognizes uiBpcSignificant but ignores the older,
+            // differently named SignificantBits annotation used by the public
+            // fixture. Fall back to the JP2 container width in that case.
+            metadata.significant_bits = Some(
+                metadata
+                    .significant_bits
+                    .unwrap_or(legacy.ihdr.storage_bits),
+            );
+            metadata.compression = Some(Nd2Compression::Jpeg2000);
+            metadata.logical_channels = Some(metadata.logical_channels.unwrap_or(1).max(1));
+            let logical_channels = metadata.logical_channels.expect("set above") as usize;
+            if !legacy.chunks.len().is_multiple_of(logical_channels) {
+                return Err(BioFormatsError::UnsupportedFormat(format!(
+                    "ND2: {} legacy codestreams cannot be divided across {logical_channels} channels",
+                    legacy.chunks.len()
+                )));
+            }
+            let physical_positions = legacy.chunks.len() / logical_channels;
+            reconcile_acquisition_dimensions(&mut metadata, physical_positions)?;
+            finalize_channel_colors(&mut metadata);
+            let mut image_chunks = Vec::new();
+            image_chunks
+                .try_reserve_exact(legacy.chunks.len())
+                .map_err(|error| {
+                    BioFormatsError::InvalidData(format!(
+                        "ND2: cannot allocate legacy image index: {error}"
+                    ))
+                })?;
+            image_chunks.extend(0..legacy.chunks.len());
+            let series = Self::build_legacy_series(&metadata, &image_chunks, legacy.ihdr)?;
+
+            self.path = source.path().map(Path::to_path_buf);
+            self.source = Some(source);
+            self.chunks = legacy.chunks;
+            self.image_chunks = image_chunks;
+            self.series = series;
+            self.current_series = 0;
+            return Ok(());
+        }
+        if signature_length < ND2_MAGIC.len() || !signature.starts_with(&ND2_MAGIC) {
+            return Err(BioFormatsError::Format(
+                "ND2: unrecognized modern or legacy container signature".into(),
+            ));
+        }
         let chunks =
             scan_chunks(&mut reader, source.info().len()).map_err(BioFormatsError::from)?;
         let mut numbered_image_chunks = chunks
@@ -2782,5 +3716,175 @@ mod tests {
         );
         assert_eq!(metadata.exposure_times_seconds, vec![0.1, 0.15]);
         assert_eq!(metadata.positions_x_um, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn legacy_xml_preserves_iso_8859_1_text_and_sanitizes_controls() {
+        let mut bytes =
+            b"<variant><VirtualComponents value=\"1\"/><sDescription value=\"caf".to_vec();
+        bytes.push(0xe9);
+        bytes.extend_from_slice(b"\"/>\x01</variant>");
+        let fragment = sanitize_legacy_xml(&bytes)
+            .expect("sanitize legacy XML")
+            .expect("legacy XML fragment");
+        assert!(fragment.contains("caf\u{e9}"));
+        assert!(!fragment.contains('\u{fffd}'));
+        let metadata = parse_nd2_text_metadata(&[fragment]);
+        assert_eq!(
+            metadata.channel_metadata[0].name.as_deref(),
+            Some("caf\u{e9}")
+        );
+    }
+
+    #[test]
+    fn legacy_xml_sanitization_is_linear_across_many_tokens() {
+        let mut bytes = b"<variant>".to_vec();
+        bytes
+            .try_reserve_exact(10_000 * 15)
+            .expect("reserve generated metadata");
+        for _ in 0..10_000 {
+            bytes.extend_from_slice(b"<!----><?xml?>");
+        }
+        bytes.extend_from_slice(b"<VirtualComponents value=\"2\"/></variant>");
+        let fragment = sanitize_legacy_xml(&bytes)
+            .expect("sanitize many legacy XML tokens")
+            .expect("sanitized metadata");
+        assert_eq!(
+            fragment,
+            "<variant><VirtualComponents value=\"2\"/></variant>"
+        );
+        assert_eq!(
+            parse_nd2_text_metadata(&[fragment]).logical_channels,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn legacy_jp2_header_child_walk_has_a_work_limit() {
+        let mut children = Vec::new();
+        for _ in 0..=MAX_JP2_HEADER_BOXES {
+            children.extend_from_slice(&8_u32.to_be_bytes());
+            children.extend_from_slice(b"free");
+        }
+        let end = children.len() as u64;
+        let parent = Jp2BoxHeader {
+            kind: *b"jp2h",
+            data_offset: 0,
+            data_length: end,
+            end,
+        };
+        assert!(matches!(
+            parse_legacy_ihdr(&mut Cursor::new(children), parent),
+            Err(BioFormatsError::InvalidData(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_series_preserves_java_axis_order_and_significant_bits() {
+        let model = Nd2MetadataModel {
+            logical_channels: Some(2),
+            size_z: Some(2),
+            size_t: Some(2),
+            series_count: Some(1),
+            significant_bits: Some(6),
+            acquisition_order: vec![Nd2Axis::T, Nd2Axis::Z],
+            ..Nd2MetadataModel::default()
+        };
+        let chunks = (0..8).collect::<Vec<_>>();
+        let series = Nd2Reader::build_legacy_series(
+            &model,
+            &chunks,
+            LegacyIhdr {
+                width: 1,
+                height: 1,
+                components: 1,
+                storage_bits: 8,
+            },
+        )
+        .expect("build legacy CTZ series");
+        assert_eq!(series[0].metadata.dimension_order, DimensionOrder::XYCTZ);
+        assert_eq!(series[0].metadata.bits_per_pixel, 6);
+        assert_eq!(
+            series[0]
+                .planes
+                .iter()
+                .map(|plane| plane.chunk_index)
+                .collect::<Vec<_>>(),
+            chunks
+        );
+
+        let singleton_c = Nd2MetadataModel {
+            logical_channels: Some(1),
+            size_z: Some(2),
+            size_t: Some(2),
+            acquisition_order: vec![Nd2Axis::Z, Nd2Axis::T],
+            ..Nd2MetadataModel::default()
+        };
+        assert_eq!(
+            legacy_dimension_order(&singleton_c, 1, 2, 2),
+            DimensionOrder::XYZTC
+        );
+    }
+
+    #[test]
+    fn jpeg2000_header_bounds_tiles_and_decoded_capacity() {
+        fn siz(width: u32, height: u32, tile_width: u32, tile_height: u32) -> Vec<u8> {
+            let mut data = vec![0xff, 0x4f, 0xff, 0x51];
+            data.extend_from_slice(&41_u16.to_be_bytes());
+            data.extend_from_slice(&0_u16.to_be_bytes());
+            data.extend_from_slice(&width.to_be_bytes());
+            data.extend_from_slice(&height.to_be_bytes());
+            data.extend_from_slice(&0_u32.to_be_bytes());
+            data.extend_from_slice(&0_u32.to_be_bytes());
+            data.extend_from_slice(&tile_width.to_be_bytes());
+            data.extend_from_slice(&tile_height.to_be_bytes());
+            data.extend_from_slice(&0_u32.to_be_bytes());
+            data.extend_from_slice(&0_u32.to_be_bytes());
+            data.extend_from_slice(&1_u16.to_be_bytes());
+            data.extend_from_slice(&[15, 1, 1]);
+            data
+        }
+
+        fn parse(data: Vec<u8>) -> Result<Jpeg2000Header> {
+            let chunk = Nd2Chunk {
+                name: "test".into(),
+                data_offset: 0,
+                data_length: data.len() as u64,
+            };
+            read_jpeg2000_header(&mut Cursor::new(data), &chunk)
+        }
+
+        assert!(matches!(
+            parse(siz(4, 4, 0, 4)),
+            Err(BioFormatsError::Format(_))
+        ));
+        assert!(matches!(
+            parse(siz(60_001, 1, 60_001, 1)),
+            Err(BioFormatsError::UnsupportedFormat(message)) if message.contains("reference grid")
+        ));
+        let mut high_origin = siz(3, 1, 3, 1);
+        high_origin[8..12].copy_from_slice(&4_294_967_293_u32.to_be_bytes());
+        high_origin[16..20].copy_from_slice(&4_294_967_290_u32.to_be_bytes());
+        high_origin[32..36].copy_from_slice(&4_294_967_290_u32.to_be_bytes());
+        assert!(matches!(
+            parse(high_origin),
+            Err(BioFormatsError::UnsupportedFormat(message)) if message.contains("reference grid")
+        ));
+        assert!(matches!(
+            parse(siz(60_000, 60_000, 1, 1)),
+            Err(BioFormatsError::UnsupportedFormat(message)) if message.contains("tiles")
+        ));
+        assert!(matches!(
+            parse(siz(60_000, 60_000, 60_000, 60_000)),
+            Err(BioFormatsError::UnsupportedFormat(message)) if message.contains("decoded bytes")
+        ));
+        let mut overflowing_grid = siz(1, 1, u32::MAX, 1);
+        overflowing_grid[8..12].copy_from_slice(&2_u32.to_be_bytes());
+        overflowing_grid[16..20].copy_from_slice(&1_u32.to_be_bytes());
+        overflowing_grid[32..36].copy_from_slice(&1_u32.to_be_bytes());
+        assert!(matches!(
+            parse(overflowing_grid),
+            Err(BioFormatsError::UnsupportedFormat(message)) if message.contains("tile grid coordinates")
+        ));
     }
 }
